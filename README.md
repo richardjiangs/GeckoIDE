@@ -1,0 +1,49 @@
+# GeskoIDE
+
+GeskoIDE is an offline code editor with the Gecko Dark theme. This repository includes the original macOS `.command` app, an Android APK build, and the GitHub Pages download site.
+
+## Downloads
+
+- macOS: `GeskoIDE.command`
+- Android: `GeskoIDE.apk`
+
+## Open GeskoIDE.command on Mac
+
+Open Terminal and run:
+
+```sh
+cd ~/Downloads
+chmod +x "GeskoIDE.command"
+xattr -d com.apple.quarantine "GeskoIDE.command"
+./"GeskoIDE.command"
+```
+
+## Install GeskoIDE.apk on Android
+
+Download `GeskoIDE.apk` on your Android device, open it, and allow installation from your browser or file manager when Android asks.
+
+The Android edition is a native offline editor with Gecko Dark styling, open/save through Android document picker, syntax coloring, templates, quick fixes, and local pattern checks. The macOS `.command` edition contains the full Python/Tkinter desktop IDE and can run its built-in self-test with:
+
+```sh
+python3 GeskoIDE.command --selftest
+```
+
+## Build the APK
+
+The APK can be rebuilt on a Mac with Android Studio installed:
+
+```sh
+./android/build-tools/build_apk.sh
+```
+
+The script uses Android Studio's bundled JDK and the local Android SDK, then writes `GeskoIDE.apk` at the repository root.
+
+## Support
+
+Bitcoin address:
+
+```text
+1G3owA2kPUuYS45XGyj8p8M3kgdHQzePBs
+```
+
+The donation QR code is included as `bitcoin-qr.jpg`.
