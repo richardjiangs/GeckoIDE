@@ -16,6 +16,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
 import android.text.Editable;
 import android.text.Spannable;
 import android.text.TextWatcher;
@@ -33,11 +34,18 @@ import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -90,6 +98,7 @@ public class MainActivity extends Activity {
     private TextView status;
     private TextView output;
     private TextView pathLabel;
+    private WebView runnerWebView;
     private Uri currentUri;
     private String currentName = "untitled.py";
     private Language currentLanguage;
@@ -164,8 +173,11 @@ public class MainActivity extends Activity {
         addButton(tools, "Fix", new View.OnClickListener() {
             @Override public void onClick(View v) { quickFix(); }
         });
-        addButton(tools, "Run", new View.OnClickListener() {
+        addButton(tools, "Check", new View.OnClickListener() {
             @Override public void onClick(View v) { runChecks(); }
+        });
+        addButton(tools, "Run", new View.OnClickListener() {
+            @Override public void onClick(View v) { runActive(); }
         });
 
         editor = new CodeEditor(this);
@@ -251,7 +263,7 @@ public class MainActivity extends Activity {
         updateStatus("Ready", ACCENT);
         output.setText("GeskoIDE Android Edition\n"
                 + languages.size() + " languages loaded from the original app.\n"
-                + "Open, save, templates, highlighting, quick fixes, and local checks work offline.");
+                + "Run works offline for Python, JavaScript, basic TypeScript, SQL, Shell, HTML, CSS, Markdown, and JSON.");
     }
 
     private void showTemplateMenu(View anchor) {
@@ -418,6 +430,290 @@ public class MainActivity extends Activity {
         return result;
     }
 
+    private void runActive() {
+        if (currentLanguage == null) currentLanguage = detectLanguage(currentName);
+        String id = currentLanguage.id;
+        String text = editor.getText().toString();
+        output.setText("");
+        updateStatus("Running", INFO);
+        if ("python".equals(id)) {
+            runInWebRuntime("python", text);
+        } else if ("javascript".equals(id) || "typescript".equals(id)) {
+            runInWebRuntime(id, text);
+        } else if ("sql".equals(id)) {
+            runSql(text);
+        } else if ("shell".equals(id)) {
+            runShell(text);
+        } else if ("json".equals(id)) {
+            runJson(text);
+        } else if ("html".equals(id)) {
+            showPreview("HTML Preview", text);
+        } else if ("css".equals(id)) {
+            showPreview("CSS Preview", "<!doctype html><html><head><style>" + escapeHtml(text)
+                    + "</style></head><body><h1>GeskoIDE CSS Preview</h1><p>Edit CSS, then Run again.</p></body></html>");
+        } else if ("markdown".equals(id)) {
+            showPreview("Markdown Preview", markdownToHtml(text));
+        } else {
+            output.setText("No bundled runtime for " + currentLanguage.name + " in this APK yet.\n"
+                    + "This is honest: GeskoIDE can edit, color, template, fix, and check this file, "
+                    + "but a real " + currentLanguage.name + " compiler/runtime is not bundled here.");
+            updateStatus("No runner", WARN);
+        }
+    }
+
+    private void runInWebRuntime(final String mode, final String code) {
+        appendOutput("info", "$ run " + mode + " (bundled offline runtime)\n");
+        runnerWebView = new WebView(this);
+        WebSettings settings = runnerWebView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setAllowFileAccess(true);
+        settings.setAllowFileAccessFromFileURLs(true);
+        settings.setAllowUniversalAccessFromFileURLs(true);
+        runnerWebView.addJavascriptInterface(new RunnerBridge(), "AndroidRunner");
+        runnerWebView.setWebViewClient(new WebViewClient() {
+            @Override public void onPageFinished(WebView view, String url) {
+                String quotedCode = JSONObject.quote(code);
+                String js;
+                if ("python".equals(mode)) {
+                    js = "GeskoRunner.runPython(" + quotedCode + ")";
+                } else {
+                    js = "GeskoRunner.runJavaScript(" + quotedCode + "," + JSONObject.quote(mode) + ")";
+                }
+                view.evaluateJavascript(js, null);
+            }
+        });
+        runnerWebView.loadUrl("file:///android_asset/runner.html");
+    }
+
+    private class RunnerBridge {
+        @JavascriptInterface
+        public void postMessage(String payload) {
+            try {
+                JSONObject obj = new JSONObject(payload);
+                final String kind = obj.optString("kind", "out");
+                final String message = obj.optString("message", "");
+                handler.post(new Runnable() {
+                    @Override public void run() {
+                        if ("ready".equals(kind)) return;
+                        if ("done".equals(kind)) {
+                            updateStatus("0".equals(message) ? "Run finished" : "Run failed",
+                                    "0".equals(message) ? ACCENT : ERROR);
+                        } else {
+                            appendOutput(kind, message);
+                        }
+                    }
+                });
+            } catch (Exception ex) {
+                handler.post(new Runnable() {
+                    @Override public void run() {
+                        appendOutput("err", "Runner bridge error\n");
+                    }
+                });
+            }
+        }
+    }
+
+    private void runJson(String text) {
+        try {
+            Object value = new JSONTokener(text).nextValue();
+            String pretty = value instanceof JSONObject
+                    ? ((JSONObject) value).toString(2)
+                    : value instanceof JSONArray ? ((JSONArray) value).toString(2) : String.valueOf(value);
+            output.setText(pretty + "\n");
+            updateStatus("Valid JSON", ACCENT);
+        } catch (Exception ex) {
+            output.setText("Invalid JSON: " + ex.getMessage() + "\n");
+            updateStatus("Invalid JSON", ERROR);
+        }
+    }
+
+    private void runSql(final String text) {
+        output.setText("$ run sql (Android SQLite)\n");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final StringBuilder result = new StringBuilder();
+                boolean ok = true;
+                SQLiteDatabase db = null;
+                try {
+                    db = SQLiteDatabase.create(null);
+                    for (String stmt : splitSql(text)) {
+                        String trimmed = stmt.trim();
+                        if (trimmed.length() == 0) continue;
+                        if (isQuery(trimmed)) {
+                            Cursor c = db.rawQuery(trimmed, null);
+                            try {
+                                appendCursor(result, c);
+                            } finally {
+                                c.close();
+                            }
+                        } else {
+                            db.execSQL(trimmed);
+                            result.append("OK: ").append(firstLine(trimmed)).append('\n');
+                        }
+                    }
+                } catch (Exception ex) {
+                    ok = false;
+                    result.append("SQL error: ").append(ex.getMessage()).append('\n');
+                } finally {
+                    if (db != null) db.close();
+                }
+                postRunResult(result.toString(), ok);
+            }
+        }).start();
+    }
+
+    private void runShell(final String text) {
+        output.setText("$ /system/bin/sh script\n");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                StringBuilder result = new StringBuilder();
+                boolean ok = true;
+                try {
+                    File script = new File(getCacheDir(), "geskoide-run.sh");
+                    FileOutputStream out = new FileOutputStream(script);
+                    out.write(text.getBytes(StandardCharsets.UTF_8));
+                    out.close();
+                    Process proc = new ProcessBuilder("/system/bin/sh", script.getAbsolutePath())
+                            .directory(getCacheDir()).redirectErrorStream(true).start();
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    InputStream in = proc.getInputStream();
+                    long start = System.currentTimeMillis();
+                    while (true) {
+                        while (in.available() > 0) {
+                            baos.write(in.read());
+                        }
+                        try {
+                            int rc = proc.exitValue();
+                            ok = rc == 0;
+                            break;
+                        } catch (IllegalThreadStateException running) {
+                            if (System.currentTimeMillis() - start > 10000) {
+                                proc.destroy();
+                                ok = false;
+                                result.append("Stopped after 10 seconds.\n");
+                                break;
+                            }
+                            Thread.sleep(60);
+                        }
+                    }
+                    result.append(new String(baos.toByteArray(), StandardCharsets.UTF_8));
+                } catch (Exception ex) {
+                    ok = false;
+                    result.append("Shell error: ").append(ex.getMessage()).append('\n');
+                }
+                postRunResult(result.toString(), ok);
+            }
+        }).start();
+    }
+
+    private void postRunResult(final String text, final boolean ok) {
+        handler.post(new Runnable() {
+            @Override public void run() {
+                appendOutput(ok ? "out" : "err", text.length() == 0 ? "(no output)\n" : text);
+                updateStatus(ok ? "Run finished" : "Run failed", ok ? ACCENT : ERROR);
+            }
+        });
+    }
+
+    private void appendOutput(String kind, String text) {
+        if (text == null || text.length() == 0) return;
+        output.append(text);
+        output.setTextColor("err".equals(kind) ? ERROR : "info".equals(kind) ? INFO : FG);
+    }
+
+    private void showPreview(String title, String html) {
+        WebView preview = new WebView(this);
+        preview.getSettings().setJavaScriptEnabled(true);
+        preview.loadDataWithBaseURL("file:///android_asset/", html, "text/html", "UTF-8", null);
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setView(preview)
+                .setPositiveButton("Close", null)
+                .show();
+        output.setText("Preview rendered inside GeskoIDE.\n");
+        updateStatus("Preview", ACCENT);
+    }
+
+    private List<String> splitSql(String text) {
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean single = false;
+        boolean dbl = false;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '\'' && !dbl) single = !single;
+            if (ch == '"' && !single) dbl = !dbl;
+            if (ch == ';' && !single && !dbl) {
+                out.add(cur.toString());
+                cur.setLength(0);
+            } else {
+                cur.append(ch);
+            }
+        }
+        if (cur.length() > 0) out.add(cur.toString());
+        return out;
+    }
+
+    private boolean isQuery(String sql) {
+        String lower = sql.toLowerCase(Locale.US);
+        return lower.startsWith("select") || lower.startsWith("pragma")
+                || lower.startsWith("with") || lower.startsWith("explain");
+    }
+
+    private void appendCursor(StringBuilder out, Cursor c) {
+        String[] cols = c.getColumnNames();
+        for (String col : cols) out.append(col).append('\t');
+        out.append('\n');
+        int rows = 0;
+        while (c.moveToNext() && rows < 200) {
+            for (int i = 0; i < cols.length; i++) out.append(c.getString(i)).append('\t');
+            out.append('\n');
+            rows++;
+        }
+        if (rows == 200) out.append("... stopped at 200 rows\n");
+        if (rows == 0) out.append("(no rows)\n");
+    }
+
+    private String firstLine(String text) {
+        int n = text.indexOf('\n');
+        String line = n >= 0 ? text.substring(0, n) : text;
+        return line.length() > 80 ? line.substring(0, 80) + "..." : line;
+    }
+
+    private String markdownToHtml(String text) {
+        StringBuilder html = new StringBuilder("<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>body{font-family:sans-serif;background:#0e1411;color:#d7e3db;padding:20px;line-height:1.55}code,pre{font-family:monospace;color:#e6a06c}a{color:#6fb7ff}h1,h2,h3{color:#3fd68f}</style></head><body>");
+        String[] lines = text.split("\n", -1);
+        boolean inList = false;
+        for (String line : lines) {
+            if (line.startsWith("# ")) {
+                if (inList) { html.append("</ul>"); inList = false; }
+                html.append("<h1>").append(inlineMarkdown(line.substring(2))).append("</h1>");
+            } else if (line.startsWith("## ")) {
+                if (inList) { html.append("</ul>"); inList = false; }
+                html.append("<h2>").append(inlineMarkdown(line.substring(3))).append("</h2>");
+            } else if (line.startsWith("- ")) {
+                if (!inList) { html.append("<ul>"); inList = true; }
+                html.append("<li>").append(inlineMarkdown(line.substring(2))).append("</li>");
+            } else if (line.trim().length() == 0) {
+                if (inList) { html.append("</ul>"); inList = false; }
+            } else {
+                if (inList) { html.append("</ul>"); inList = false; }
+                html.append("<p>").append(inlineMarkdown(line)).append("</p>");
+            }
+        }
+        if (inList) html.append("</ul>");
+        return html.append("</body></html>").toString();
+    }
+
+    private String inlineMarkdown(String text) {
+        return escapeHtml(text).replaceAll("`([^`]+)`", "<code>$1</code>")
+                .replaceAll("\\*\\*([^*]+)\\*\\*", "<strong>$1</strong>");
+    }
+
+    private String escapeHtml(String text) {
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
     private void quickFix() {
         String text = editor.getText().toString();
         String fixed = text;
@@ -477,8 +773,7 @@ public class MainActivity extends Activity {
         addLanguageChecks(text, lines, issues);
 
         if (issues.isEmpty()) {
-            output.setText("No obvious issues found.\n"
-                    + currentLanguage.name + " checks ran locally on Android.");
+            output.setText("No checker issues found.\nUse Run to execute supported languages.");
             updateStatus("Clean", ACCENT);
         } else {
             StringBuilder sb = new StringBuilder();

@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<script src="pyodide/pyodide.js"></script>
+<script>
+let pyodidePromise = null;
+
+function send(kind, message) {
+  try {
+    AndroidRunner.postMessage(JSON.stringify({ kind, message: String(message ?? "") }));
+  } catch (err) {
+  }
+}
+
+function basicTypeScriptToJavaScript(source) {
+  return source
+    .replace(/^\s*interface\s+\w+\s*\{[\s\S]*?\}\s*/gm, "")
+    .replace(/^\s*type\s+\w+\s*=\s*[^;\n]+;?\s*/gm, "")
+    .replace(/:\s*(?:void|string|number|boolean|object|any|unknown|never|bigint|symbol|[A-Z][A-Za-z0-9_<>,\s\[\]\|&.?]*)\s*(?=[,)=;{])/g, "")
+    .replace(/\)\s*:\s*(?:void|string|number|boolean|object|any|unknown|never|bigint|symbol|[A-Z][A-Za-z0-9_<>,\s\[\]\|&.?]*)\s*\{/g, ") {")
+    .replace(/\b(?:public|private|protected|readonly|declare)\s+/g, "");
+}
+
+async function getPyodideRuntime() {
+  if (!pyodidePromise) {
+    send("info", "Loading bundled Python runtime...\n");
+    pyodidePromise = loadPyodide({ indexURL: "pyodide/" });
+  }
+  return await pyodidePromise;
+}
+
+async function runPython(code) {
+  try {
+    const pyodide = await getPyodideRuntime();
+    pyodide.setStdout({ batched: (text) => send("out", text + "\n") });
+    pyodide.setStderr({ batched: (text) => send("err", text + "\n") });
+    await pyodide.runPythonAsync(code);
+    send("done", "0");
+  } catch (err) {
+    send("err", (err && err.stack ? err.stack : err) + "\n");
+    send("done", "1");
+  }
+}
+
+async function runJavaScript(code, mode) {
+  const originalConsole = window.console;
+  const log = (kind, args) => send(kind, args.map((x) => {
+    if (typeof x === "string") return x;
+    try { return JSON.stringify(x); } catch (err) { return String(x); }
+  }).join(" ") + "\n");
+  window.console = {
+    log: (...args) => log("out", args),
+    info: (...args) => log("out", args),
+    warn: (...args) => log("err", args),
+    error: (...args) => log("err", args)
+  };
+  try {
+    const runnable = mode === "typescript" ? basicTypeScriptToJavaScript(code) : code;
+    const fn = new Function('"use strict"; return (async function(){\n' + runnable + '\n})();');
+    const result = await fn();
+    if (result !== undefined) send("out", String(result) + "\n");
+    send("done", "0");
+  } catch (err) {
+    send("err", (err && err.stack ? err.stack : err) + "\n");
+    send("done", "1");
+  } finally {
+    window.console = originalConsole;
+  }
+}
+
+window.GeskoRunner = { runPython, runJavaScript };
+send("ready", "ready");
+</script>
