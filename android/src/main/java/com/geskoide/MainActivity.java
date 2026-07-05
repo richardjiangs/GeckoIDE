@@ -18,7 +18,6 @@ import android.provider.OpenableColumns;
 import android.database.Cursor;
 import android.text.Editable;
 import android.text.Spannable;
-import android.text.TextPaint;
 import android.text.TextWatcher;
 import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
@@ -35,16 +34,23 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.json.JSONTokener;
+
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -77,22 +83,8 @@ public class MainActivity extends Activity {
     private static final int OP = Color.rgb(127, 216, 192);
     private static final int BRACKET = Color.rgb(224, 180, 88);
 
-    private static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
-            "and", "as", "assert", "async", "await", "break", "case", "catch", "class",
-            "const", "continue", "def", "default", "delete", "do", "elif", "else", "except",
-            "export", "extends", "false", "finally", "for", "from", "function", "global",
-            "if", "import", "in", "interface", "is", "lambda", "let", "match", "new",
-            "nonlocal", "not", "null", "or", "pass", "private", "public", "raise", "return",
-            "static", "super", "switch", "this", "throw", "true", "try", "type", "var",
-            "void", "while", "with", "yield"
-    ));
-
-    private static final Set<String> BUILTINS = new HashSet<>(Arrays.asList(
-            "print", "len", "range", "open", "input", "int", "float", "str", "bool",
-            "list", "dict", "set", "tuple", "console", "log", "document", "window",
-            "Math", "JSON", "Array", "Object", "String", "Number", "Boolean", "Map", "Set"
-    ));
-
+    private final List<Language> languages = new ArrayList<>();
+    private final Map<String, Language> languagesById = new LinkedHashMap<>();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private CodeEditor editor;
     private TextView status;
@@ -100,6 +92,7 @@ public class MainActivity extends Activity {
     private TextView pathLabel;
     private Uri currentUri;
     private String currentName = "untitled.py";
+    private Language currentLanguage;
     private boolean dirty;
     private boolean highlighting;
 
@@ -113,6 +106,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        loadLanguages();
         buildUi();
         loadInitialDocument();
     }
@@ -154,6 +148,9 @@ public class MainActivity extends Activity {
 
         addButton(tools, "New", new View.OnClickListener() {
             @Override public void onClick(View v) { showTemplateMenu(v); }
+        });
+        addButton(tools, "Lang", new View.OnClickListener() {
+            @Override public void onClick(View v) { showLanguageMenu(v); }
         });
         addButton(tools, "Open", new View.OnClickListener() {
             @Override public void onClick(View v) { openDocument(); }
@@ -249,38 +246,51 @@ public class MainActivity extends Activity {
             return;
         }
         setDocument("untitled.py",
-                "def main():\n" +
-                "    print(\"Hello from GeskoIDE on Android\")\n\n" +
-                "if __name__ == \"__main__\":\n" +
-                "    main()\n");
+                languageById("python").skeleton);
         dirty = false;
         updateStatus("Ready", ACCENT);
-        output.setText("GeskoIDE Android Edition\nOffline editor with Gecko Dark colors.");
+        output.setText("GeskoIDE Android Edition\n"
+                + languages.size() + " languages loaded from the original app.\n"
+                + "Open, save, templates, highlighting, quick fixes, and local checks work offline.");
     }
 
     private void showTemplateMenu(View anchor) {
         PopupMenu menu = new PopupMenu(this, anchor);
-        menu.getMenu().add("Python");
-        menu.getMenu().add("JavaScript");
-        menu.getMenu().add("HTML");
-        menu.getMenu().add("Plain Text");
+        for (int i = 0; i < languages.size(); i++) {
+            Language lang = languages.get(i);
+            menu.getMenu().add(0, i, i, lang.name + " (" + lang.defaultExt() + ")");
+        }
         menu.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
             @Override public boolean onMenuItemClick(MenuItem item) {
-                String choice = item.getTitle().toString();
-                if ("Python".equals(choice)) {
-                    setDocument("untitled.py", "def main():\n    \n\nif __name__ == \"__main__\":\n    main()\n");
-                } else if ("JavaScript".equals(choice)) {
-                    setDocument("untitled.js", "function main() {\n  console.log(\"Hello from GeskoIDE\");\n}\n\nmain();\n");
-                } else if ("HTML".equals(choice)) {
-                    setDocument("untitled.html", "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>GeskoIDE</title>\n</head>\n<body>\n  <h1>Hello</h1>\n</body>\n</html>\n");
-                } else {
-                    setDocument("untitled.txt", "");
-                }
+                Language lang = languages.get(item.getItemId());
+                currentLanguage = lang;
+                setDocument("untitled" + lang.defaultExt(), lang.skeleton);
                 currentUri = null;
                 dirty = false;
                 output.setText("");
-                updateStatus("New file", ACCENT);
+                updateStatus("New " + lang.name, ACCENT);
                 showKeyboard();
+                return true;
+            }
+        });
+        menu.show();
+    }
+
+    private void showLanguageMenu(View anchor) {
+        PopupMenu menu = new PopupMenu(this, anchor);
+        for (int i = 0; i < languages.size(); i++) {
+            Language lang = languages.get(i);
+            menu.getMenu().add(0, i, i, lang.name + " (" + lang.defaultExt() + ")");
+        }
+        menu.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
+            @Override public boolean onMenuItemClick(MenuItem item) {
+                currentLanguage = languages.get(item.getItemId());
+                if (currentName != null && currentName.startsWith("untitled.")) {
+                    currentName = "untitled" + currentLanguage.defaultExt();
+                }
+                highlight();
+                updateStatus(currentLanguage.name, ACCENT);
+                output.setText("Language set to " + currentLanguage.name + ".");
                 return true;
             }
         });
@@ -372,9 +382,15 @@ public class MainActivity extends Activity {
 
     private void setDocument(String name, String text) {
         currentName = name;
+        currentLanguage = detectLanguage(name);
         highlighting = true;
         editor.setText(text);
-        editor.setSelection(Math.min(editor.length(), Math.max(0, text.indexOf("\n") + 1)));
+        int marker = text.indexOf("\u00ab\u00bb");
+        if (marker >= 0) {
+            editor.setSelection(marker, marker + 2);
+        } else {
+            editor.setSelection(Math.min(editor.length(), Math.max(0, text.indexOf("\n") + 1)));
+        }
         highlighting = false;
         updatePathLabel();
         highlight();
@@ -404,13 +420,14 @@ public class MainActivity extends Activity {
 
     private void quickFix() {
         String text = editor.getText().toString();
-        String fixed = text
-                .replaceAll("(?m)^(\\s*(if|elif|else|for|while|def|class|try|except|finally|with)\\b[^:\\n]*)$", "$1:")
-                .replace("print \"", "print(\"")
-                .replace("print '", "print('");
+        String fixed = text;
+        if (isLang("python")) {
+            fixed = fixPython(fixed);
+        }
+        fixed = closeUnbalanced(fixed);
         if (!fixed.equals(text)) {
             editor.setText(fixed);
-            editor.setSelection(Math.min(fixed.length(), editor.getSelectionStart()));
+            editor.setSelection(Math.min(fixed.length(), Math.max(0, editor.getSelectionStart())));
             dirty = true;
             updateStatus("Fixed", ACCENT);
             runChecks();
@@ -433,11 +450,11 @@ public class MainActivity extends Activity {
                     || trimmed.startsWith("def ") || trimmed.startsWith("class ") || trimmed.startsWith("else")
                     || trimmed.startsWith("elif ") || trimmed.startsWith("try") || trimmed.startsWith("except")
                     || trimmed.startsWith("finally") || trimmed.startsWith("with ")) {
-                if (!trimmed.endsWith(":") && currentName.endsWith(".py")) {
+                if (!trimmed.endsWith(":") && isLang("python")) {
                     issues.add("line " + (i + 1) + ": missing ':'");
                 }
             }
-            if (trimmed.startsWith("print ") && !trimmed.startsWith("print(") && currentName.endsWith(".py")) {
+            if (trimmed.startsWith("print ") && !trimmed.startsWith("print(") && isLang("python")) {
                 issues.add("line " + (i + 1) + ": Python 2 style print");
             }
             for (int j = 0; j < line.length(); j++) {
@@ -450,12 +467,18 @@ public class MainActivity extends Activity {
                 if (ch == ']') brackets--;
             }
         }
-        if (parens != 0) issues.add("unbalanced parentheses");
-        if (braces != 0) issues.add("unbalanced braces");
-        if (brackets != 0) issues.add("unbalanced brackets");
+        if (parens > 0) issues.add("unclosed '('");
+        if (parens < 0) issues.add("extra ')'");
+        if (braces > 0) issues.add("unclosed '{'");
+        if (braces < 0) issues.add("extra '}'");
+        if (brackets > 0) issues.add("unclosed '['");
+        if (brackets < 0) issues.add("extra ']'");
+
+        addLanguageChecks(text, lines, issues);
 
         if (issues.isEmpty()) {
-            output.setText("No obvious issues found.\nAndroid edition checks syntax patterns locally.");
+            output.setText("No obvious issues found.\n"
+                    + currentLanguage.name + " checks ran locally on Android.");
             updateStatus("Clean", ACCENT);
         } else {
             StringBuilder sb = new StringBuilder();
@@ -472,8 +495,7 @@ public class MainActivity extends Activity {
         for (ForegroundColorSpan span : old) {
             text.removeSpan(span);
         }
-        applyRegex(text, "\"([^\"\\\\]|\\\\.)*\"|'([^'\\\\]|\\\\.)*'", STRING);
-        applyRegex(text, "(?m)#.*$|//.*$", COMMENT);
+        Language lang = currentLanguage == null ? languageById("text") : currentLanguage;
         applyRegex(text, "\\b\\d+(?:\\.\\d+)?\\b", NUMBER);
         applyRegex(text, "[(){}\\[\\]]", BRACKET);
         applyRegex(text, "[+\\-*/%=!<>|&]+", OP);
@@ -481,34 +503,306 @@ public class MainActivity extends Activity {
         Matcher word = Pattern.compile("\\b[A-Za-z_][A-Za-z0-9_]*\\b").matcher(text);
         while (word.find()) {
             String token = word.group();
-            if (KEYWORDS.contains(token)) {
+            if (lang.keywords.contains(token)) {
                 text.setSpan(new ForegroundColorSpan(KW), word.start(), word.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-            } else if (BUILTINS.contains(token)) {
+            } else if (lang.types.contains(token) || lang.builtins.contains(token)) {
                 text.setSpan(new ForegroundColorSpan(BUILTIN), word.start(), word.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else if (lang.constants.contains(token)) {
+                text.setSpan(new ForegroundColorSpan(NUMBER), word.start(), word.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
             }
         }
+        if (isLang("html")) {
+            applyRegex(text, "</?[A-Za-z][A-Za-z0-9:-]*\\b|/?>|<![A-Za-z][^>]*>", KW);
+            applyRegex(text, "\\b[a-zA-Z-:]+(?=\\s*=)", BUILTIN);
+        } else if (isLang("markdown")) {
+            applyRegex(text, "(?m)^#{1,6}\\s.*$", KW);
+            applyRegex(text, "`[^`]*`", STRING);
+            applyRegex(text, "\\[[^\\]]+\\]\\([^)]+\\)", BUILTIN);
+        } else if (isLang("css")) {
+            applyRegex(text, "[.#][A-Za-z_-][A-Za-z0-9_-]*", BUILTIN);
+            applyRegex(text, "\\b[A-Za-z-]+(?=\\s*:)", KW);
+        }
+        applyStrings(text, lang);
+        applyComments(text, lang);
         highlighting = false;
         updatePathLabel();
         editor.invalidate();
     }
 
     private void applyRegex(Editable text, String regex, int color) {
-        Matcher matcher = Pattern.compile(regex).matcher(text);
+        try {
+            Matcher matcher = Pattern.compile(regex).matcher(text);
+            while (matcher.find()) {
+                text.setSpan(new ForegroundColorSpan(color), matcher.start(), matcher.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void loadLanguages() {
+        try {
+            InputStream in = getAssets().open("languages.json");
+            JSONObject root = new JSONObject(readAll(in));
+            JSONArray arr = root.getJSONArray("languages");
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                JSONArray extsJson = obj.getJSONArray("exts");
+                List<String> exts = new ArrayList<>();
+                for (int j = 0; j < extsJson.length(); j++) {
+                    exts.add(extsJson.getString(j));
+                }
+                JSONArray blockJson = obj.optJSONArray("block_comment");
+                String blockStart = "";
+                String blockEnd = "";
+                if (blockJson != null && blockJson.length() >= 2) {
+                    blockStart = blockJson.getString(0);
+                    blockEnd = blockJson.getString(1);
+                }
+                addLanguage(new Language(
+                        obj.getString("id"),
+                        obj.getString("name"),
+                        exts,
+                        obj.optString("line_comment", ""),
+                        blockStart,
+                        blockEnd,
+                        obj.optString("strings", ""),
+                        obj.optBoolean("backtick", false),
+                        splitWords(obj.optString("keywords", "")),
+                        splitWords(obj.optString("types", "")),
+                        splitWords(obj.optString("builtins", "")),
+                        splitWords(obj.optString("constants", "")),
+                        obj.optString("family", obj.getString("id")),
+                        obj.optString("run", obj.getString("id")),
+                        obj.optString("skeleton", "")));
+            }
+        } catch (Exception ex) {
+            addLanguage(new Language("python", "Python", Arrays.asList(".py", ".pyw"), "#", "", "",
+                    "\"'", false,
+                    splitWords("and as assert async await break class continue def elif else except finally for from if import in is not or pass raise return try while with yield"),
+                    splitWords("Exception ValueError TypeError SyntaxError"),
+                    splitWords("print len range open input int float str bool list dict set tuple"),
+                    splitWords("True False None"), "python", "python",
+                    "#!/usr/bin/env python3\n\n\ndef main():\n    \u00ab\u00bb\n\n\nif __name__ == \"__main__\":\n    main()\n"));
+            addLanguage(new Language("text", "Plain Text", Arrays.asList(".txt"), "#", "", "",
+                    "\"'", false, new HashSet<String>(), new HashSet<String>(), new HashSet<String>(),
+                    new HashSet<String>(), "text", "text", "\u00ab\u00bb\n"));
+        }
+        currentLanguage = languageById("python");
+    }
+
+    private void addLanguage(Language lang) {
+        languages.add(lang);
+        languagesById.put(lang.id, lang);
+    }
+
+    private String readAll(InputStream in) throws Exception {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            sb.append(line).append('\n');
+        }
+        reader.close();
+        return sb.toString();
+    }
+
+    private Set<String> splitWords(String words) {
+        Set<String> out = new HashSet<>();
+        for (String word : words.split("\\s+")) {
+            if (word.length() > 0) out.add(word);
+        }
+        return out;
+    }
+
+    private Language languageById(String id) {
+        Language lang = languagesById.get(id);
+        return lang != null ? lang : languages.get(0);
+    }
+
+    private Language detectLanguage(String name) {
+        String lower = name == null ? "" : name.toLowerCase(Locale.US);
+        for (Language lang : languages) {
+            for (String ext : lang.exts) {
+                if (lower.endsWith(ext.toLowerCase(Locale.US))) {
+                    return lang;
+                }
+            }
+        }
+        return languagesById.containsKey("text") ? languageById("text") : languages.get(0);
+    }
+
+    private boolean isLang(String id) {
+        return currentLanguage != null && id.equals(currentLanguage.id);
+    }
+
+    private String fixPython(String text) {
+        String[] lines = text.split("\n", -1);
+        StringBuilder out = new StringBuilder(text.length() + 16);
+        Pattern block = Pattern.compile("^(\\s*(if|elif|else|for|while|def|class|try|except|finally|with)\\b[^:#\\n]*)(\\s*(#.*)?)$");
+        Pattern py2Print = Pattern.compile("^(\\s*)print\\s+([\"'].*[\"'])\\s*$");
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            Matcher print = py2Print.matcher(line);
+            if (print.matches()) {
+                line = print.group(1) + "print(" + print.group(2) + ")";
+            }
+            Matcher matcher = block.matcher(line);
+            String trimmed = line.trim();
+            if (matcher.matches() && !trimmed.endsWith(":") && !trimmed.endsWith("\\")) {
+                line = matcher.group(1) + ":" + matcher.group(3);
+            }
+            out.append(line);
+            if (i < lines.length - 1) out.append('\n');
+        }
+        return out.toString();
+    }
+
+    private String closeUnbalanced(String text) {
+        ArrayDeque<Character> stack = new ArrayDeque<>();
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '(' || ch == '[' || ch == '{') {
+                stack.push(ch);
+            } else if ((ch == ')' || ch == ']' || ch == '}') && !stack.isEmpty()) {
+                char open = stack.peek();
+                if ((open == '(' && ch == ')') || (open == '[' && ch == ']') || (open == '{' && ch == '}')) {
+                    stack.pop();
+                }
+            }
+        }
+        StringBuilder add = new StringBuilder();
+        while (!stack.isEmpty()) {
+            add.append(matchingClose(stack.pop()));
+        }
+        if (add.length() == 0) return text;
+        return text + (text.endsWith("\n") ? "" : "\n") + add + "\n";
+    }
+
+    private char matchingClose(char open) {
+        if (open == '(') return ')';
+        if (open == '[') return ']';
+        return '}';
+    }
+
+    private void addLanguageChecks(String text, String[] lines, List<String> issues) {
+        if (isLang("json")) checkJson(text, issues);
+        if (isLang("html")) checkHtml(text, issues);
+        if (isLang("java")) checkJava(text, issues);
+        if (isLang("shell")) checkShell(lines, issues);
+        if (isLang("yaml")) {
+            for (int i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith("\t")) {
+                    issues.add("line " + (i + 1) + ": YAML indentation should use spaces, not tabs");
+                }
+            }
+        }
+    }
+
+    private void checkJson(String text, List<String> issues) {
+        try {
+            JSONTokener tokener = new JSONTokener(text);
+            tokener.nextValue();
+            if (tokener.nextClean() != 0) {
+                issues.add("JSON has extra data after the first value");
+            }
+        } catch (Exception ex) {
+            issues.add("JSON parse error: " + ex.getMessage());
+        }
+    }
+
+    private void checkHtml(String text, List<String> issues) {
+        Set<String> voidTags = new HashSet<>(Arrays.asList(
+                "area", "base", "br", "col", "embed", "hr", "img", "input",
+                "link", "meta", "param", "source", "track", "wbr"));
+        ArrayDeque<String> stack = new ArrayDeque<>();
+        Matcher matcher = Pattern.compile("<(/?)([A-Za-z][A-Za-z0-9:-]*)([^>]*)>").matcher(text);
         while (matcher.find()) {
-            text.setSpan(new ForegroundColorSpan(color), matcher.start(), matcher.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+            String close = matcher.group(1);
+            String tag = matcher.group(2).toLowerCase(Locale.US);
+            String rest = matcher.group(3);
+            if (voidTags.contains(tag) || rest.trim().endsWith("/")) continue;
+            if (close.length() == 0) {
+                stack.push(tag);
+            } else if (stack.isEmpty()) {
+                issues.add("HTML closing tag without opener: </" + tag + ">");
+            } else {
+                String open = stack.pop();
+                if (!open.equals(tag)) {
+                    issues.add("HTML tag mismatch: expected </" + open + "> before </" + tag + ">");
+                }
+            }
+        }
+        if (!stack.isEmpty()) {
+            issues.add("HTML unclosed tag: <" + stack.peek() + ">");
+        }
+    }
+
+    private void checkJava(String text, List<String> issues) {
+        if (currentName == null || !currentName.endsWith(".java")) return;
+        Matcher matcher = Pattern.compile("\\bpublic\\s+class\\s+([A-Za-z_$][A-Za-z0-9_$]*)").matcher(text);
+        if (matcher.find()) {
+            String expected = currentName.substring(0, currentName.length() - 5);
+            if (!expected.equals(matcher.group(1))) {
+                issues.add("Java public class should match file name: " + expected);
+            }
+        }
+    }
+
+    private void checkShell(String[] lines, List<String> issues) {
+        int ifs = 0;
+        int dos = 0;
+        int cases = 0;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith("#")) continue;
+            if (trimmed.matches(".*\\bif\\b.*")) ifs++;
+            if (trimmed.matches(".*\\bfi\\b.*")) ifs--;
+            if (trimmed.matches(".*\\b(do)$")) dos++;
+            if (trimmed.matches(".*\\bdone\\b.*")) dos--;
+            if (trimmed.matches(".*\\bcase\\b.*")) cases++;
+            if (trimmed.matches(".*\\besac\\b.*")) cases--;
+        }
+        if (ifs > 0) issues.add("shell block may be missing 'fi'");
+        if (dos > 0) issues.add("shell loop may be missing 'done'");
+        if (cases > 0) issues.add("shell case may be missing 'esac'");
+    }
+
+    private void applyStrings(Editable text, Language lang) {
+        if (isLang("python")) {
+            applyRegex(text, "(?s)\"\"\".*?\"\"\"|'''.*?'''", STRING);
+        }
+        if (lang.strings.contains("\"")) {
+            applyRegex(text, "\"([^\"\\\\]|\\\\.)*\"", STRING);
+        }
+        if (lang.strings.contains("'")) {
+            applyRegex(text, "'([^'\\\\]|\\\\.)*'", STRING);
+        }
+        if (lang.backtick) {
+            applyRegex(text, "`([^`\\\\]|\\\\.)*`", STRING);
+        }
+    }
+
+    private void applyComments(Editable text, Language lang) {
+        if (lang.lineComment.length() > 0 && !"text".equals(lang.id)) {
+            applyRegex(text, "(?m)" + Pattern.quote(lang.lineComment) + ".*$", COMMENT);
+        }
+        if (lang.blockStart.length() > 0 && lang.blockEnd.length() > 0) {
+            applyRegex(text, "(?s)" + Pattern.quote(lang.blockStart) + ".*?" + Pattern.quote(lang.blockEnd), COMMENT);
         }
     }
 
     private void updatePathLabel() {
         String mark = dirty ? " *" : "";
         String uriText = currentUri == null ? "local draft" : currentUri.toString();
-        pathLabel.setText(currentName + mark + "  -  " + uriText);
+        String lang = currentLanguage == null ? "" : currentLanguage.name + "  -  ";
+        pathLabel.setText(currentName + mark + "  -  " + lang + uriText);
     }
 
     private void updateStatus(String message, int color) {
         int lines = editor == null ? 0 : editor.getLineCount();
         int chars = editor == null ? 0 : editor.length();
-        status.setText(String.format(Locale.US, "%s   lines %d   chars %d", message, lines, chars));
+        String lang = currentLanguage == null ? "Text" : currentLanguage.name;
+        status.setText(String.format(Locale.US, "%s   %s   lines %d   chars %d", message, lang, lines, chars));
         status.setTextColor(color);
         updatePathLabel();
     }
@@ -534,6 +828,49 @@ public class MainActivity extends Activity {
 
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private static class Language {
+        final String id;
+        final String name;
+        final List<String> exts;
+        final String lineComment;
+        final String blockStart;
+        final String blockEnd;
+        final String strings;
+        final boolean backtick;
+        final Set<String> keywords;
+        final Set<String> types;
+        final Set<String> builtins;
+        final Set<String> constants;
+        final String family;
+        final String run;
+        final String skeleton;
+
+        Language(String id, String name, List<String> exts, String lineComment,
+                 String blockStart, String blockEnd, String strings, boolean backtick,
+                 Set<String> keywords, Set<String> types, Set<String> builtins,
+                 Set<String> constants, String family, String run, String skeleton) {
+            this.id = id;
+            this.name = name;
+            this.exts = exts;
+            this.lineComment = lineComment == null ? "" : lineComment;
+            this.blockStart = blockStart == null ? "" : blockStart;
+            this.blockEnd = blockEnd == null ? "" : blockEnd;
+            this.strings = strings == null ? "" : strings;
+            this.backtick = backtick;
+            this.keywords = keywords;
+            this.types = types;
+            this.builtins = builtins;
+            this.constants = constants;
+            this.family = family;
+            this.run = run;
+            this.skeleton = skeleton == null ? "" : skeleton;
+        }
+
+        String defaultExt() {
+            return exts.isEmpty() ? ".txt" : exts.get(0);
+        }
     }
 
     public static class CodeEditor extends android.widget.EditText {

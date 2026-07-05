@@ -33,11 +33,12 @@ mkdir -p "$OUT/compiled" "$OUT/generated" "$OUT/classes" "$OUT/dex"
   -I "$PLATFORM" \
   --manifest "$APP_DIR/src/main/AndroidManifest.xml" \
   --java "$OUT/generated" \
+  -A "$APP_DIR/src/main/assets" \
   --auto-add-overlay \
   --min-sdk-version 23 \
   --target-sdk-version 36 \
-  --version-code 12 \
-  --version-name 1.2.0 \
+  --version-code 13 \
+  --version-name 1.2.1 \
   -o "$OUT/GeskoIDE-unsigned.apk" \
   "$OUT/compiled/resources.zip"
 
@@ -49,7 +50,8 @@ cp "$OUT/GeskoIDE-unsigned.apk" "$OUT/GeskoIDE-classes.apk"
 (cd "$OUT/dex" && zip -q -u "$OUT/GeskoIDE-classes.apk" classes.dex)
 "$ZIPALIGN" -f -p 4 "$OUT/GeskoIDE-classes.apk" "$OUT/GeskoIDE-aligned.apk"
 
-KEYSTORE="$OUT/debug.keystore"
+KEYSTORE="$APP_DIR/keystore/geskoide.keystore"
+mkdir -p "$(dirname "$KEYSTORE")"
 if [ ! -f "$KEYSTORE" ]; then
   "$KEYTOOL" -genkeypair \
     -keystore "$KEYSTORE" \

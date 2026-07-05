@@ -1,6 +1,6 @@
 # GeskoIDE
 
-GeskoIDE is an offline code editor with the Gecko Dark theme. This repository includes the original macOS `.command` app, an Android APK build, and the GitHub Pages download site.
+GeskoIDE is an offline code editor with the Gecko Dark theme. This repository includes the original macOS `.command` app, a corrected Android APK build, and the GitHub Pages download site.
 
 ## Downloads
 
@@ -22,7 +22,9 @@ xattr -d com.apple.quarantine "GeskoIDE.command"
 
 Download `GeskoIDE.apk` on your Android device, open it, and allow installation from your browser or file manager when Android asks.
 
-The Android edition is a native offline editor with Gecko Dark styling, open/save through Android document picker, syntax coloring, templates, quick fixes, and local pattern checks. The macOS `.command` edition contains the full Python/Tkinter desktop IDE and can run its built-in self-test with:
+The Android edition is a native offline editor with Gecko Dark styling, open/save through Android document picker, syntax coloring, templates, quick fixes, and local pattern checks. It includes the same 24 language definitions and skeleton templates as the `.command` app: Python, JavaScript, TypeScript, HTML, CSS, JSON, Markdown, C, C++, C#, Java, Go, Rust, Ruby, PHP, Shell, Swift, Kotlin, Lua, SQL, YAML, AppleScript, Perl, and Plain Text.
+
+The macOS `.command` edition contains the full Python/Tkinter desktop IDE and can run its built-in self-test with:
 
 ```sh
 python3 GeskoIDE.command --selftest
@@ -36,7 +38,7 @@ The APK can be rebuilt on a Mac with Android Studio installed:
 ./android/build-tools/build_apk.sh
 ```
 
-The script uses Android Studio's bundled JDK and the local Android SDK, then writes `GeskoIDE.apk` at the repository root.
+The script uses Android Studio's bundled JDK, the local Android SDK, and the checked-in GeskoIDE signing key, then writes `GeskoIDE.apk` at the repository root.
 
 ## Support
 
