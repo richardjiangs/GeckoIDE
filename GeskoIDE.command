@@ -1744,9 +1744,9 @@ def build_steps(lang_id, path, debug=False):
         if not g:
             return _tool_missing(
                 "Go", "Install once from go.dev (or: brew install go). "
-                "A compiler can't be bundled inside GeskoIDE - it's a large "
-                "platform binary - but once Go is on your Mac, Run and Debug "
-                "here work with no internet.")
+                "The Android APK bundles its own Go runner; this Mac .command "
+                "file stays a single Python app and uses the tools installed "
+                "on this computer.")
         if debug:
             dlv = which_tool("dlv")
             if dlv:

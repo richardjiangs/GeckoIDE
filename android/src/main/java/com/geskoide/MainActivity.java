@@ -263,7 +263,7 @@ public class MainActivity extends Activity {
         updateStatus("Ready", ACCENT);
         output.setText("GeskoIDE Android Edition\n"
                 + languages.size() + " languages loaded from the original app.\n"
-                + "Run works offline for Python, JavaScript, basic TypeScript, SQL, Shell, HTML, CSS, Markdown, and JSON.");
+                + "Run works offline for Python, Go, JavaScript, basic TypeScript, SQL, Shell, HTML, CSS, Markdown, and JSON.");
     }
 
     private void showTemplateMenu(View anchor) {
@@ -438,6 +438,8 @@ public class MainActivity extends Activity {
         updateStatus("Running", INFO);
         if ("python".equals(id)) {
             runInWebRuntime("python", text);
+        } else if ("go".equals(id)) {
+            runInWebRuntime("go", text);
         } else if ("javascript".equals(id) || "typescript".equals(id)) {
             runInWebRuntime(id, text);
         } else if ("sql".equals(id)) {
@@ -454,7 +456,7 @@ public class MainActivity extends Activity {
         } else if ("markdown".equals(id)) {
             showPreview("Markdown Preview", markdownToHtml(text));
         } else {
-            output.setText("No bundled runtime for " + currentLanguage.name + " in this APK yet.\n"
+            output.setText("No bundled runtime for " + currentLanguage.name + " in this APK build.\n"
                     + "This is honest: GeskoIDE can edit, color, template, fix, and check this file, "
                     + "but a real " + currentLanguage.name + " compiler/runtime is not bundled here.");
             updateStatus("No runner", WARN);
@@ -476,6 +478,8 @@ public class MainActivity extends Activity {
                 String js;
                 if ("python".equals(mode)) {
                     js = "GeskoRunner.runPython(" + quotedCode + ")";
+                } else if ("go".equals(mode)) {
+                    js = "GeskoRunner.runGo(" + quotedCode + ")";
                 } else {
                     js = "GeskoRunner.runJavaScript(" + quotedCode + "," + JSONObject.quote(mode) + ")";
                 }
