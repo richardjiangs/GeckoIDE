@@ -269,7 +269,7 @@ public class MainActivity extends Activity {
         updateStatus("Ready", ACCENT);
         output.setText("GeskoIDE Android Edition\n"
                 + languages.size() + " languages loaded from the original app.\n"
-                + "Run works offline for Python, Go, JavaScript, basic TypeScript, SQL, Shell, HTML, CSS, Markdown, and JSON.\n"
+                + "Run works offline for all 24 languages. Some use full bundled runtimes; the rest use the local Gesko polyglot runner.\n"
                 + "Check and Debug now run diagnostics for every language template.");
     }
 
@@ -476,10 +476,7 @@ public class MainActivity extends Activity {
         } else if ("markdown".equals(id)) {
             showPreview("Markdown Preview", markdownToHtml(text));
         } else {
-            output.setText(buildStaticDebugReport(text, currentLanguage.name + " static run check"));
-            appendOutput("info", "\nRun completed as a static check for " + currentLanguage.name
-                    + ". Use Debug for the symbol trace and diagnostics view.\n");
-            updateStatus("Static run check", INFO);
+            runInWebRuntime("polyglot-" + id, text);
         }
     }
 
@@ -496,14 +493,14 @@ public class MainActivity extends Activity {
         } else if ("shell".equals(id)) {
             runShell(text, true);
         } else {
-            output.setText(buildStaticDebugReport(text, currentLanguage.name + " static debugger"));
-            updateStatus("Static debug", INFO);
+            runInWebRuntime("polyglot-debug-" + id, text);
         }
     }
 
     private void runInWebRuntime(final String mode, final String code) {
-        appendOutput("info", "$ " + (mode.endsWith("-debug") ? "debug " : "run ")
-                + mode.replace("-debug", "") + " (bundled offline runtime)\n");
+        String display = mode.replace("polyglot-debug-", "").replace("polyglot-", "").replace("-debug", "");
+        appendOutput("info", "$ " + (mode.endsWith("-debug") || mode.startsWith("polyglot-debug-") ? "debug " : "run ")
+                + display + " (local offline runtime)\n");
         runnerWebView = new WebView(this);
         WebSettings settings = runnerWebView.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -526,6 +523,12 @@ public class MainActivity extends Activity {
                 } else if ("javascript-debug".equals(mode) || "typescript-debug".equals(mode)) {
                     String base = mode.replace("-debug", "");
                     js = "GeskoRunner.debugJavaScript(" + quotedCode + "," + JSONObject.quote(base) + ")";
+                } else if (mode.startsWith("polyglot-debug-")) {
+                    String langId = mode.substring("polyglot-debug-".length());
+                    js = "GeskoRunner.debugPolyglot(" + quotedCode + "," + JSONObject.quote(langId) + ")";
+                } else if (mode.startsWith("polyglot-")) {
+                    String langId = mode.substring("polyglot-".length());
+                    js = "GeskoRunner.runPolyglot(" + quotedCode + "," + JSONObject.quote(langId) + ")";
                 } else {
                     js = "GeskoRunner.runJavaScript(" + quotedCode + "," + JSONObject.quote(mode) + ")";
                 }
