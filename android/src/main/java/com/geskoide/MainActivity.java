@@ -126,9 +126,13 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        loadLanguages();
-        buildUi();
-        loadInitialDocument();
+        try {
+            loadLanguages();
+            buildUi();
+            loadInitialDocument();
+        } catch (Throwable ex) {
+            buildSafeUi(ex);
+        }
     }
 
     private void buildUi() {
@@ -272,6 +276,142 @@ public class MainActivity extends Activity {
         status.setPadding(dp(12), dp(7), dp(12), dp(7));
         status.setBackgroundColor(STATUS_BG);
         root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+    }
+
+    private void buildSafeUi(Throwable startupError) {
+        if (languages.isEmpty()) {
+            addLanguage(new Language("python", "Python", Arrays.asList(".py", ".pyw"), "#", "", "",
+                    "\"'", false,
+                    splitWords("and as assert async await break class continue def elif else except finally for from if import in is not or pass raise return try while with yield"),
+                    splitWords("Exception ValueError TypeError SyntaxError"),
+                    splitWords("print len range open input int float str bool list dict set tuple"),
+                    splitWords("True False None"), "python", "python",
+                    "#!/usr/bin/env python3\n\n\ndef main():\n    \u00ab\u00bb\n\n\nif __name__ == \"__main__\":\n    main()\n"));
+            addLanguage(new Language("text", "Plain Text", Arrays.asList(".txt"), "#", "", "",
+                    "\"'", false, new HashSet<String>(), new HashSet<String>(), new HashSet<String>(),
+                    new HashSet<String>(), "text", "text", "\u00ab\u00bb\n"));
+        }
+        currentLanguage = languageById("python");
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(BG);
+        setContentView(root);
+
+        LinearLayout titleBar = new LinearLayout(this);
+        titleBar.setOrientation(LinearLayout.VERTICAL);
+        titleBar.setPadding(dp(14), dp(12), dp(14), dp(8));
+        titleBar.setBackgroundColor(PANEL);
+        root.addView(titleBar, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView title = new TextView(this);
+        title.setText("GeskoIDE");
+        title.setTextColor(FG);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextSize(22);
+        titleBar.addView(title);
+
+        pathLabel = new TextView(this);
+        pathLabel.setTextColor(DIM);
+        pathLabel.setTextSize(12);
+        pathLabel.setSingleLine(true);
+        titleBar.addView(pathLabel);
+
+        HorizontalScrollView toolsScroller = new HorizontalScrollView(this);
+        toolsScroller.setHorizontalScrollBarEnabled(false);
+        toolsScroller.setBackgroundColor(PANEL);
+        root.addView(toolsScroller, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout tools = new LinearLayout(this);
+        tools.setOrientation(LinearLayout.HORIZONTAL);
+        tools.setPadding(dp(10), dp(0), dp(10), dp(10));
+        toolsScroller.addView(tools);
+        addButton(tools, "New", new View.OnClickListener() {
+            @Override public void onClick(View v) { showTemplateMenu(v); }
+        });
+        addButton(tools, "Lang", new View.OnClickListener() {
+            @Override public void onClick(View v) { showLanguageMenu(v); }
+        });
+        addButton(tools, "Open", new View.OnClickListener() {
+            @Override public void onClick(View v) { openDocument(); }
+        });
+        addButton(tools, "Save", new View.OnClickListener() {
+            @Override public void onClick(View v) { saveDocument(); }
+        });
+        addButton(tools, "Fix", new View.OnClickListener() {
+            @Override public void onClick(View v) { quickFix(); }
+        });
+        addButton(tools, "Check", new View.OnClickListener() {
+            @Override public void onClick(View v) { runChecks(); }
+        });
+        addButton(tools, "Run", new View.OnClickListener() {
+            @Override public void onClick(View v) { runActive(); }
+        });
+
+        outlinePanel = new LinearLayout(this);
+        outlineList = new LinearLayout(this);
+        outlineVisible = false;
+
+        editor = new CodeEditor(this);
+        editor.setTextSize(15);
+        editor.setTextColor(FG);
+        editor.setHintTextColor(FAINT);
+        editor.setGravity(Gravity.TOP | Gravity.START);
+        editor.setTypeface(Typeface.MONOSPACE);
+        editor.setBackgroundColor(EDITOR_BG);
+        editor.setHorizontallyScrolling(true);
+        editor.setVerticalScrollBarEnabled(true);
+        editor.setHorizontalScrollBarEnabled(true);
+        editor.setScrollbarFadingEnabled(false);
+        editor.setSingleLine(false);
+        editor.setMinLines(18);
+        editor.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        editor.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                if (!highlighting) {
+                    dirty = true;
+                    updateStatus("Editing", INFO);
+                    handler.removeCallbacks(highlightRunnable);
+                    handler.postDelayed(highlightRunnable, 160);
+                }
+            }
+        });
+        root.addView(editor, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        ScrollView outputScroll = new ScrollView(this);
+        outputScroll.setBackgroundColor(PANEL);
+        output = new TextView(this);
+        output.setTextColor(DIM);
+        output.setTypeface(Typeface.MONOSPACE);
+        output.setTextSize(12);
+        output.setPadding(dp(12), dp(8), dp(12), dp(8));
+        outputScroll.addView(output, new ScrollView.LayoutParams(-1, -2));
+        root.addView(outputScroll, new LinearLayout.LayoutParams(-1, dp(128)));
+
+        status = new TextView(this);
+        status.setTextColor(DIM);
+        status.setTextSize(12);
+        status.setSingleLine(true);
+        status.setPadding(dp(12), dp(7), dp(12), dp(7));
+        status.setBackgroundColor(STATUS_BG);
+        root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+
+        currentName = "untitled.py";
+        try {
+            setDocument(currentName, languageById("python").skeleton);
+        } catch (Throwable ignored) {
+            editor.setText(languageById("python").skeleton);
+        }
+        dirty = false;
+        updateStatus("Ready", ACCENT);
+        output.setText("GeskoIDE opened in safe mode after a startup error.\n"
+                + startupError.getClass().getSimpleName() + ": "
+                + String.valueOf(startupError.getMessage()) + "\n"
+                + "Editing, open/save, check, fix, and run still work here.");
     }
 
     private void addButton(LinearLayout parent, String label, View.OnClickListener listener) {
