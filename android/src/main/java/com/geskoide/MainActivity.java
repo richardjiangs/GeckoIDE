@@ -98,10 +98,14 @@ public class MainActivity extends Activity {
     private TextView status;
     private TextView output;
     private TextView pathLabel;
+    private LinearLayout outlinePanel;
+    private LinearLayout outlineList;
     private WebView runnerWebView;
     private Uri currentUri;
     private String currentName = "untitled.py";
     private Language currentLanguage;
+    private final List<CheckIssue> lastIssues = new ArrayList<>();
+    private boolean outlineVisible;
     private boolean dirty;
     private boolean highlighting;
 
@@ -109,6 +113,13 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             highlight();
+        }
+    };
+
+    private final Runnable outlineRunnable = new Runnable() {
+        @Override
+        public void run() {
+            updateOutline();
         }
     };
 
@@ -155,6 +166,9 @@ public class MainActivity extends Activity {
         tools.setPadding(dp(10), dp(0), dp(10), dp(10));
         toolsScroller.addView(tools);
 
+        addButton(tools, "Outline", new View.OnClickListener() {
+            @Override public void onClick(View v) { toggleOutline(); }
+        });
         addButton(tools, "New", new View.OnClickListener() {
             @Override public void onClick(View v) { showTemplateMenu(v); }
         });
@@ -188,6 +202,11 @@ public class MainActivity extends Activity {
         editor.setTypeface(Typeface.MONOSPACE);
         editor.setBackgroundColor(EDITOR_BG);
         editor.setHorizontallyScrolling(true);
+        editor.setVerticalScrollBarEnabled(true);
+        editor.setHorizontalScrollBarEnabled(true);
+        editor.setScrollBarStyle(View.SCROLLBARS_INSIDE_INSET);
+        editor.setScrollbarFadingEnabled(false);
+        editor.setOverScrollMode(View.OVER_SCROLL_ALWAYS);
         editor.setSingleLine(false);
         editor.setMinLines(18);
         editor.setInputType(android.text.InputType.TYPE_CLASS_TEXT
@@ -202,11 +221,39 @@ public class MainActivity extends Activity {
                     updateStatus("Editing", INFO);
                     handler.removeCallbacks(highlightRunnable);
                     handler.postDelayed(highlightRunnable, 160);
+                    if (outlineVisible) {
+                        handler.removeCallbacks(outlineRunnable);
+                        handler.postDelayed(outlineRunnable, 350);
+                    }
                 }
             }
         });
 
-        root.addView(editor, new LinearLayout.LayoutParams(-1, 0, 1f));
+        LinearLayout editorRow = new LinearLayout(this);
+        editorRow.setOrientation(LinearLayout.HORIZONTAL);
+        editorRow.setBackgroundColor(EDITOR_BG);
+        root.addView(editorRow, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        outlinePanel = new LinearLayout(this);
+        outlinePanel.setOrientation(LinearLayout.VERTICAL);
+        outlinePanel.setBackgroundColor(PANEL);
+        outlinePanel.setPadding(0, dp(6), 0, dp(6));
+        TextView outlineTitle = new TextView(this);
+        outlineTitle.setText("OUTLINE");
+        outlineTitle.setTextColor(DIM);
+        outlineTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        outlineTitle.setTextSize(12);
+        outlineTitle.setPadding(dp(12), dp(3), dp(8), dp(6));
+        outlinePanel.addView(outlineTitle, new LinearLayout.LayoutParams(-1, -2));
+        ScrollView outlineScroll = new ScrollView(this);
+        outlineScroll.setScrollbarFadingEnabled(false);
+        outlineList = new LinearLayout(this);
+        outlineList.setOrientation(LinearLayout.VERTICAL);
+        outlineScroll.addView(outlineList, new ScrollView.LayoutParams(-1, -2));
+        outlinePanel.addView(outlineScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+        outlinePanel.setVisibility(View.GONE);
+        editorRow.addView(outlinePanel, new LinearLayout.LayoutParams(dp(230), -1));
+        editorRow.addView(editor, new LinearLayout.LayoutParams(0, -1, 1f));
 
         ScrollView outputScroll = new ScrollView(this);
         outputScroll.setBackgroundColor(PANEL);
@@ -301,12 +348,61 @@ public class MainActivity extends Activity {
                     currentName = "untitled" + currentLanguage.defaultExt();
                 }
                 highlight();
+                updateOutlineIfVisible();
                 updateStatus(currentLanguage.name, ACCENT);
                 output.setText("Language set to " + currentLanguage.name + ".");
                 return true;
             }
         });
         menu.show();
+    }
+
+    private void toggleOutline() {
+        outlineVisible = !outlineVisible;
+        outlinePanel.setVisibility(outlineVisible ? View.VISIBLE : View.GONE);
+        if (outlineVisible) {
+            updateOutline();
+        }
+    }
+
+    private void updateOutlineIfVisible() {
+        if (outlineVisible) {
+            updateOutline();
+        }
+    }
+
+    private void updateOutline() {
+        if (outlineList == null) return;
+        outlineList.removeAllViews();
+        List<OutlineItem> items = buildOutline(editor.getText().toString());
+        if (items.isEmpty()) {
+            TextView empty = outlineRowText("No outline items yet.", 0, false);
+            outlineList.addView(empty);
+            return;
+        }
+        for (final OutlineItem item : items) {
+            TextView row = outlineRowText(String.format(Locale.US, "%4d  %s %s",
+                    item.line, item.kind, item.name), item.level, true);
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    goToLine(item.line);
+                }
+            });
+            outlineList.addView(row);
+        }
+    }
+
+    private TextView outlineRowText(String text, int level, boolean active) {
+        TextView row = new TextView(this);
+        row.setText(text);
+        row.setSingleLine(true);
+        row.setTextSize(12);
+        row.setTypeface(Typeface.MONOSPACE);
+        row.setTextColor(active ? FG : FAINT);
+        row.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        row.setPadding(dp(10 + level * 14), dp(5), dp(8), dp(5));
+        row.setBackgroundColor(PANEL);
+        return row;
     }
 
     private void openDocument() {
@@ -406,6 +502,7 @@ public class MainActivity extends Activity {
         highlighting = false;
         updatePathLabel();
         highlight();
+        updateOutlineIfVisible();
     }
 
     private String displayName(Uri uri) {
@@ -720,29 +817,52 @@ public class MainActivity extends Activity {
 
     private void quickFix() {
         String text = editor.getText().toString();
-        String fixed = text;
-        if (isLang("python")) {
-            fixed = fixPython(fixed);
-        }
-        fixed = closeUnbalanced(fixed);
+        int cursor = Math.max(0, editor.getSelectionStart());
+        List<CheckIssue> issues = collectIssues(text);
+        String fixed = applyFixes(text, issues);
         if (!fixed.equals(text)) {
             editor.setText(fixed);
-            editor.setSelection(Math.min(fixed.length(), Math.max(0, editor.getSelectionStart())));
+            editor.setSelection(Math.min(fixed.length(), cursor));
             dirty = true;
             updateStatus("Fixed", ACCENT);
+            updateOutlineIfVisible();
             runChecks();
         } else {
+            int fixable = 0;
+            for (CheckIssue issue : issues) {
+                if (issue.fix != null) fixable++;
+            }
+            output.setText(fixable == 0
+                    ? "No automatic fix is available for the current checker issues.\n"
+                    : "No text changed. The automatic fix was already applied or could not be placed safely.\n");
             updateStatus("Nothing to fix", DIM);
         }
     }
 
     private void runChecks() {
         String text = editor.getText().toString();
-        List<String> issues = new ArrayList<>();
+        List<CheckIssue> issues = collectIssues(text);
+        lastIssues.clear();
+        lastIssues.addAll(issues);
+        if (issues.isEmpty()) {
+            output.setText("No checker issues found.\nUse Run to execute supported languages.");
+            updateStatus("Clean", ACCENT);
+        } else {
+            StringBuilder sb = new StringBuilder();
+            for (CheckIssue issue : issues) {
+                sb.append(issue.message);
+                if (issue.fix != null) sb.append("  [Fix]");
+                sb.append('\n');
+            }
+            output.setText(sb.toString());
+            updateStatus(issues.size() + " issue" + (issues.size() == 1 ? "" : "s"), WARN);
+        }
+    }
+
+    private List<CheckIssue> collectIssues(String text) {
+        List<CheckIssue> issues = new ArrayList<>();
         String[] lines = text.split("\n", -1);
-        int parens = 0;
-        int braces = 0;
-        int brackets = 0;
+        ArrayDeque<Character> stack = new ArrayDeque<>();
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i];
             String trimmed = line.trim();
@@ -751,40 +871,144 @@ public class MainActivity extends Activity {
                     || trimmed.startsWith("elif ") || trimmed.startsWith("try") || trimmed.startsWith("except")
                     || trimmed.startsWith("finally") || trimmed.startsWith("with ")) {
                 if (!trimmed.endsWith(":") && isLang("python")) {
-                    issues.add("line " + (i + 1) + ": missing ':'");
+                    addIssue(issues, i + 1, "missing ':'", "colon", null);
                 }
             }
             if (trimmed.startsWith("print ") && !trimmed.startsWith("print(") && isLang("python")) {
-                issues.add("line " + (i + 1) + ": Python 2 style print");
+                addIssue(issues, i + 1, "Python 2 style print", "print_call", null);
+            }
+            if (isSemicolonLanguage() && semicolonCandidate(trimmed)) {
+                addIssue(issues, i + 1, "statement may be missing ';'", "semicolon", null);
+            }
+            if (isLang("yaml") && line.startsWith("\t")) {
+                addIssue(issues, i + 1, "YAML indentation should use spaces, not tabs", "yaml_tabs", null);
             }
             for (int j = 0; j < line.length(); j++) {
                 char ch = line.charAt(j);
-                if (ch == '(') parens++;
-                if (ch == ')') parens--;
-                if (ch == '{') braces++;
-                if (ch == '}') braces--;
-                if (ch == '[') brackets++;
-                if (ch == ']') brackets--;
+                if (ch == '(' || ch == '{' || ch == '[') {
+                    stack.push(ch);
+                } else if (ch == ')' || ch == '}' || ch == ']') {
+                    if (!stack.isEmpty() && matchingClose(stack.peek()) == ch) {
+                        stack.pop();
+                    } else {
+                        addIssue(issues, i + 1, "extra '" + ch + "'", null, null);
+                    }
+                }
             }
         }
-        if (parens > 0) issues.add("unclosed '('");
-        if (parens < 0) issues.add("extra ')'");
-        if (braces > 0) issues.add("unclosed '{'");
-        if (braces < 0) issues.add("extra '}'");
-        if (brackets > 0) issues.add("unclosed '['");
-        if (brackets < 0) issues.add("extra ']'");
-
-        addLanguageChecks(text, lines, issues);
-
-        if (issues.isEmpty()) {
-            output.setText("No checker issues found.\nUse Run to execute supported languages.");
-            updateStatus("Clean", ACCENT);
-        } else {
-            StringBuilder sb = new StringBuilder();
-            for (String issue : issues) sb.append(issue).append('\n');
-            output.setText(sb.toString());
-            updateStatus(issues.size() + " issue" + (issues.size() == 1 ? "" : "s"), WARN);
+        if (!stack.isEmpty()) {
+            StringBuilder closes = new StringBuilder();
+            while (!stack.isEmpty()) {
+                closes.append(matchingClose(stack.pop()));
+            }
+            addIssue(issues, lines.length, "unclosed bracket(s)", "append_eof", closes.toString());
         }
+        addLanguageChecks(text, lines, issues);
+        return issues;
+    }
+
+    private void addIssue(List<CheckIssue> issues, int line, String message, String fix, String data) {
+        issues.add(new CheckIssue(line, "line " + Math.max(1, line) + ": " + message, fix, data));
+    }
+
+    private boolean isSemicolonLanguage() {
+        return isLang("c") || isLang("cpp") || isLang("java") || isLang("csharp");
+    }
+
+    private boolean semicolonCandidate(String trimmed) {
+        if (trimmed.length() == 0) return false;
+        if (trimmed.startsWith("#") || trimmed.startsWith("@") || trimmed.startsWith("//")
+                || trimmed.startsWith("/*") || trimmed.startsWith("*") || trimmed.startsWith("}")) {
+            return false;
+        }
+        if (trimmed.endsWith(";") || trimmed.endsWith("{") || trimmed.endsWith("}") || trimmed.endsWith(":")) {
+            return false;
+        }
+        String first = trimmed.split("\\s+", 2)[0];
+        if (Arrays.asList("if", "else", "for", "while", "switch", "case", "default",
+                "try", "catch", "finally", "class", "interface", "enum", "namespace",
+                "public", "private", "protected", "using", "import", "package").contains(first)) {
+            return false;
+        }
+        char last = trimmed.charAt(trimmed.length() - 1);
+        return Character.isLetterOrDigit(last) || last == ')' || last == ']' || last == '"' || last == '\'';
+    }
+
+    private String applyFixes(String text, List<CheckIssue> issues) {
+        String[] lines = text.split("\n", -1);
+        StringBuilder append = new StringBuilder();
+        boolean changed = false;
+        for (CheckIssue issue : issues) {
+            if (issue.fix == null) continue;
+            if ("append_eof".equals(issue.fix)) {
+                if (issue.data != null && issue.data.length() > 0) {
+                    append.append(issue.data);
+                    if (!issue.data.endsWith("\n")) append.append('\n');
+                    changed = true;
+                }
+                continue;
+            }
+            int idx = Math.max(0, Math.min(lines.length - 1, issue.line - 1));
+            String before = lines[idx];
+            String after = fixLine(before, issue);
+            if (after != null && !after.equals(before)) {
+                lines[idx] = after;
+                changed = true;
+            }
+        }
+        String fixed = joinLines(lines);
+        if (append.length() > 0) {
+            if (!fixed.endsWith("\n")) fixed += "\n";
+            fixed += append.toString();
+        }
+        return changed ? fixed : text;
+    }
+
+    private String fixLine(String line, CheckIssue issue) {
+        if ("colon".equals(issue.fix)) {
+            String[] parts = splitLineComment(line);
+            String code = parts[0].trim().endsWith(":") ? parts[0] : parts[0].replaceFirst("\\s+$", "") + ":";
+            return code + parts[1];
+        }
+        if ("print_call".equals(issue.fix)) {
+            Matcher matcher = Pattern.compile("^(\\s*)print\\s+(.+?)\\s*$").matcher(line);
+            return matcher.matches() ? matcher.group(1) + "print(" + matcher.group(2) + ")" : null;
+        }
+        if ("semicolon".equals(issue.fix)) {
+            String[] parts = splitLineComment(line);
+            String code = parts[0].replaceFirst("\\s+$", "");
+            return code.endsWith(";") ? null : code + ";" + parts[1];
+        }
+        if ("yaml_tabs".equals(issue.fix)) {
+            Matcher matcher = Pattern.compile("^\\t+").matcher(line);
+            if (matcher.find()) {
+                String spaces = matcher.group().replace("\t", "    ");
+                return spaces + line.substring(matcher.end());
+            }
+            return null;
+        }
+        if ("rename_class".equals(issue.fix) && issue.data != null) {
+            return line.replaceFirst("\\bpublic\\s+class\\s+[A-Za-z_$][A-Za-z0-9_$]*",
+                    "public class " + issue.data);
+        }
+        return null;
+    }
+
+    private String[] splitLineComment(String line) {
+        String marker = currentLanguage == null ? "" : currentLanguage.lineComment;
+        if (marker == null || marker.length() == 0) return new String[]{line, ""};
+        int idx = line.indexOf(marker);
+        if (idx < 0) return new String[]{line, ""};
+        return new String[]{line.substring(0, idx), "  " + line.substring(idx)};
+    }
+
+    private String joinLines(String[] lines) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < lines.length; i++) {
+            if (i > 0) sb.append('\n');
+            sb.append(lines[i]);
+        }
+        return sb.toString();
     }
 
     private void highlight() {
@@ -934,6 +1158,108 @@ public class MainActivity extends Activity {
         return currentLanguage != null && id.equals(currentLanguage.id);
     }
 
+    private void goToLine(final int line) {
+        int targetLine = Math.max(1, Math.min(line, editor.getLineCount()));
+        String text = editor.getText().toString();
+        int offset = 0;
+        int current = 1;
+        while (offset < text.length() && current < targetLine) {
+            if (text.charAt(offset++) == '\n') current++;
+        }
+        final int selection = Math.min(offset, editor.length());
+        editor.requestFocus();
+        editor.setSelection(selection);
+        editor.post(new Runnable() {
+            @Override public void run() {
+                android.text.Layout layout = editor.getLayout();
+                if (layout != null) {
+                    int lineIndex = Math.max(0, Math.min(line - 1, layout.getLineCount() - 1));
+                    editor.scrollTo(editor.getScrollX(), Math.max(0, layout.getLineTop(lineIndex)));
+                }
+            }
+        });
+        updateStatus("Line " + targetLine, ACCENT);
+    }
+
+    private List<OutlineItem> buildOutline(String text) {
+        List<OutlineItem> items = new ArrayList<>();
+        String id = currentLanguage == null ? "text" : currentLanguage.id;
+        String[] lines = text.split("\n", -1);
+        for (int i = 0; i < lines.length && items.size() < 600; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            if (trimmed.length() == 0 || (!"markdown".equals(id) && trimmed.startsWith("#")) || trimmed.startsWith("//")
+                    || trimmed.startsWith("/*") || trimmed.startsWith("*") || trimmed.startsWith("--")) {
+                continue;
+            }
+            int level = outlineLevel(line);
+            Matcher matcher = null;
+            if ("python".equals(id)) {
+                matcher = Pattern.compile("^\\s*(async\\s+def|def|class)\\s+([A-Za-z_]\\w*)").matcher(line);
+                if (matcher.find()) {
+                    items.add(new OutlineItem(i + 1, level, matcher.group(1), matcher.group(2)));
+                    continue;
+                }
+            } else if ("markdown".equals(id)) {
+                matcher = Pattern.compile("^(#{1,6})\\s+(.+?)\\s*#*\\s*$").matcher(line);
+                if (matcher.find()) {
+                    items.add(new OutlineItem(i + 1, matcher.group(1).length() - 1, "heading", matcher.group(2)));
+                    continue;
+                }
+            } else if ("html".equals(id)) {
+                matcher = Pattern.compile("^\\s*<\\s*(h[1-6]|section|article|main|nav|div)\\b([^>]*)>", Pattern.CASE_INSENSITIVE).matcher(line);
+                if (matcher.find()) {
+                    String name = matcher.group(1).toLowerCase(Locale.US);
+                    Matcher ident = Pattern.compile("\\b(?:id|class)\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]").matcher(matcher.group(2));
+                    if (ident.find()) name += " #" + ident.group(1);
+                    items.add(new OutlineItem(i + 1, level, "tag", name));
+                    continue;
+                }
+            } else if ("css".equals(id) && trimmed.endsWith("{")) {
+                items.add(new OutlineItem(i + 1, level, "rule", trimmed.substring(0, trimmed.length() - 1).trim()));
+                continue;
+            } else if ("sql".equals(id)) {
+                matcher = Pattern.compile("^\\s*create\\s+(table|view|index|trigger|function|procedure)\\s+([A-Za-z_][\\w.]*)", Pattern.CASE_INSENSITIVE).matcher(line);
+                if (matcher.find()) {
+                    items.add(new OutlineItem(i + 1, level, matcher.group(1).toLowerCase(Locale.US), matcher.group(2)));
+                    continue;
+                }
+            }
+
+            matcher = Pattern.compile("^\\s*(?:export\\s+|public\\s+|private\\s+|protected\\s+|internal\\s+|open\\s+|final\\s+|abstract\\s+|sealed\\s+|data\\s+|static\\s+)*(class|interface|enum|struct|record|object|trait)\\s+([A-Za-z_$][\\w$]*)").matcher(line);
+            if (matcher.find()) {
+                items.add(new OutlineItem(i + 1, level, matcher.group(1), matcher.group(2)));
+                continue;
+            }
+            matcher = Pattern.compile("^\\s*(?:export\\s+|async\\s+|suspend\\s+|static\\s+)*(func|fun|function|def|fn)\\s+(?:\\([^)]*\\)\\s*)?([A-Za-z_$][\\w$]*)").matcher(line);
+            if (matcher.find()) {
+                items.add(new OutlineItem(i + 1, level, matcher.group(1), matcher.group(2)));
+                continue;
+            }
+            if (Arrays.asList("c", "cpp", "java", "csharp", "go", "rust", "swift", "kotlin").contains(id)) {
+                matcher = Pattern.compile("^\\s*(?:[A-Za-z_$][\\w$<>\\[\\],.?*&:\\s]+\\s+)+([A-Za-z_$][\\w$]*)\\s*\\([^;{}]*\\)\\s*(?:\\{|=>)?\\s*$").matcher(line);
+                if (matcher.find()) {
+                    String name = matcher.group(1);
+                    if (!Arrays.asList("if", "for", "while", "switch", "catch").contains(name)) {
+                        items.add(new OutlineItem(i + 1, level, "method", name));
+                    }
+                }
+            }
+        }
+        return items;
+    }
+
+    private int outlineLevel(String line) {
+        int width = 0;
+        for (int i = 0; i < line.length(); i++) {
+            char ch = line.charAt(i);
+            if (ch == ' ') width++;
+            else if (ch == '\t') width += 4;
+            else break;
+        }
+        return Math.min(8, width / 4);
+    }
+
     private String fixPython(String text) {
         String[] lines = text.split("\n", -1);
         StringBuilder out = new StringBuilder(text.length() + 16);
@@ -983,33 +1309,26 @@ public class MainActivity extends Activity {
         return '}';
     }
 
-    private void addLanguageChecks(String text, String[] lines, List<String> issues) {
+    private void addLanguageChecks(String text, String[] lines, List<CheckIssue> issues) {
         if (isLang("json")) checkJson(text, issues);
         if (isLang("html")) checkHtml(text, issues);
         if (isLang("java")) checkJava(text, issues);
         if (isLang("shell")) checkShell(lines, issues);
-        if (isLang("yaml")) {
-            for (int i = 0; i < lines.length; i++) {
-                if (lines[i].startsWith("\t")) {
-                    issues.add("line " + (i + 1) + ": YAML indentation should use spaces, not tabs");
-                }
-            }
-        }
     }
 
-    private void checkJson(String text, List<String> issues) {
+    private void checkJson(String text, List<CheckIssue> issues) {
         try {
             JSONTokener tokener = new JSONTokener(text);
             tokener.nextValue();
             if (tokener.nextClean() != 0) {
-                issues.add("JSON has extra data after the first value");
+                addIssue(issues, 1, "JSON has extra data after the first value", null, null);
             }
         } catch (Exception ex) {
-            issues.add("JSON parse error: " + ex.getMessage());
+            addIssue(issues, 1, "JSON parse error: " + ex.getMessage(), null, null);
         }
     }
 
-    private void checkHtml(String text, List<String> issues) {
+    private void checkHtml(String text, List<CheckIssue> issues) {
         Set<String> voidTags = new HashSet<>(Arrays.asList(
                 "area", "base", "br", "col", "embed", "hr", "img", "input",
                 "link", "meta", "param", "source", "track", "wbr"));
@@ -1023,31 +1342,32 @@ public class MainActivity extends Activity {
             if (close.length() == 0) {
                 stack.push(tag);
             } else if (stack.isEmpty()) {
-                issues.add("HTML closing tag without opener: </" + tag + ">");
+                addIssue(issues, lineForOffset(text, matcher.start()), "HTML closing tag without opener: </" + tag + ">", null, null);
             } else {
                 String open = stack.pop();
                 if (!open.equals(tag)) {
-                    issues.add("HTML tag mismatch: expected </" + open + "> before </" + tag + ">");
+                    addIssue(issues, lineForOffset(text, matcher.start()), "HTML tag mismatch: expected </" + open + "> before </" + tag + ">", null, null);
                 }
             }
         }
         if (!stack.isEmpty()) {
-            issues.add("HTML unclosed tag: <" + stack.peek() + ">");
+            String tag = stack.peek();
+            addIssue(issues, text.split("\n", -1).length, "HTML unclosed tag: <" + tag + ">", "append_eof", "</" + tag + ">");
         }
     }
 
-    private void checkJava(String text, List<String> issues) {
+    private void checkJava(String text, List<CheckIssue> issues) {
         if (currentName == null || !currentName.endsWith(".java")) return;
         Matcher matcher = Pattern.compile("\\bpublic\\s+class\\s+([A-Za-z_$][A-Za-z0-9_$]*)").matcher(text);
         if (matcher.find()) {
             String expected = currentName.substring(0, currentName.length() - 5);
             if (!expected.equals(matcher.group(1))) {
-                issues.add("Java public class should match file name: " + expected);
+                addIssue(issues, lineForOffset(text, matcher.start(1)), "Java public class should match file name: " + expected, "rename_class", expected);
             }
         }
     }
 
-    private void checkShell(String[] lines, List<String> issues) {
+    private void checkShell(String[] lines, List<CheckIssue> issues) {
         int ifs = 0;
         int dos = 0;
         int cases = 0;
@@ -1061,9 +1381,25 @@ public class MainActivity extends Activity {
             if (trimmed.matches(".*\\bcase\\b.*")) cases++;
             if (trimmed.matches(".*\\besac\\b.*")) cases--;
         }
-        if (ifs > 0) issues.add("shell block may be missing 'fi'");
-        if (dos > 0) issues.add("shell loop may be missing 'done'");
-        if (cases > 0) issues.add("shell case may be missing 'esac'");
+        if (ifs > 0) addIssue(issues, lines.length, "shell block may be missing 'fi'", "append_eof", repeatWord("fi", ifs));
+        if (dos > 0) addIssue(issues, lines.length, "shell loop may be missing 'done'", "append_eof", repeatWord("done", dos));
+        if (cases > 0) addIssue(issues, lines.length, "shell case may be missing 'esac'", "append_eof", repeatWord("esac", cases));
+    }
+
+    private int lineForOffset(String text, int offset) {
+        int line = 1;
+        for (int i = 0; i < Math.min(offset, text.length()); i++) {
+            if (text.charAt(i) == '\n') line++;
+        }
+        return line;
+    }
+
+    private String repeatWord(String word, int count) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            sb.append(word).append('\n');
+        }
+        return sb.toString();
     }
 
     private void applyStrings(Editable text, Language lang) {
@@ -1127,6 +1463,34 @@ public class MainActivity extends Activity {
 
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private static class CheckIssue {
+        final int line;
+        final String message;
+        final String fix;
+        final String data;
+
+        CheckIssue(int line, String message, String fix, String data) {
+            this.line = line;
+            this.message = message;
+            this.fix = fix;
+            this.data = data;
+        }
+    }
+
+    private static class OutlineItem {
+        final int line;
+        final int level;
+        final String kind;
+        final String name;
+
+        OutlineItem(int line, int level, String kind, String name) {
+            this.line = line;
+            this.level = level;
+            this.kind = kind == null ? "" : kind;
+            this.name = name == null ? "" : name;
+        }
     }
 
     private static class Language {

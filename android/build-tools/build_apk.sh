@@ -37,8 +37,8 @@ mkdir -p "$OUT/compiled" "$OUT/generated" "$OUT/classes" "$OUT/dex"
   --auto-add-overlay \
   --min-sdk-version 23 \
   --target-sdk-version 36 \
-  --version-code 15 \
-  --version-name 1.4.0 \
+  --version-code 16 \
+  --version-name 1.5.0 \
   -0 .wasm \
   -0 .zip \
   -o "$OUT/GeskoIDE-unsigned.apk" \

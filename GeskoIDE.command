@@ -40,7 +40,7 @@ from bisect import bisect_right
 from collections import Counter, namedtuple
 
 APP = "GeskoIDE"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 IS_MAC = (sys.platform == "darwin")
 IS_WIN = (sys.platform == "win32")
 
@@ -937,6 +937,7 @@ def depth_at_line_starts(line_starts, events):
 Issue = namedtuple("Issue", "line col end severity msg fix")
 # line: 1-based, col/end: 0-based columns, severity: error|warn|info,
 # fix: (kind, data) or None.
+OutlineItem = namedtuple("OutlineItem", "line level kind name")
 
 SEV_ORDER = {"error": 0, "warn": 1, "info": 2}
 
@@ -1481,6 +1482,76 @@ def fixed_line_text(line, issue, sp):
             return line[:c] + "==" + line[c + 1:]
         return None
     return None
+
+
+def outline_items(text, lang_id, limit=600):
+    """Build a compact table-of-contents for a source buffer."""
+    out = []
+    sp = LANGS.get(lang_id, LANGS["text"])
+    unit = max(1, sp.get("indent", 4))
+
+    def level_of(line):
+        raw = line[:len(line) - len(line.lstrip(" \t"))]
+        width = 0
+        for ch in raw:
+            width += unit if ch == "\t" else 1
+        return min(8, width // unit)
+
+    def add(line_no, level, kind, name):
+        name = re.sub(r"\s+", " ", name.strip())
+        if name and len(out) < limit:
+            out.append(OutlineItem(line_no, level, kind, name[:96]))
+
+    for line_no, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if (not stripped or stripped.startswith(("//", "/*", "*", "--"))
+                or (lang_id != "markdown" and stripped.startswith("#"))):
+            continue
+        level = level_of(line)
+        m = None
+
+        if lang_id == "python":
+            m = re.match(r"^\s*(async\s+def|def|class)\s+([A-Za-z_]\w*)", line)
+            if m:
+                add(line_no, level, m.group(1), m.group(2))
+                continue
+        elif lang_id == "markdown":
+            m = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
+            if m:
+                add(line_no, len(m.group(1)) - 1, "heading", m.group(2))
+                continue
+        elif lang_id in ("html",):
+            m = re.match(r"^\s*<\s*(h[1-6]|section|article|main|nav|div)\b([^>]*)>", line, re.I)
+            if m:
+                attrs = m.group(2)
+                label = m.group(1).lower()
+                ident = re.search(r"\b(?:id|class)\s*=\s*['\"]([^'\"]+)['\"]", attrs)
+                add(line_no, level, "tag", label + ((" #" + ident.group(1)) if ident else ""))
+                continue
+        elif lang_id in ("css",):
+            if stripped.endswith("{"):
+                add(line_no, level, "rule", stripped[:-1].strip())
+                continue
+        elif lang_id == "sql":
+            m = re.match(r"^\s*create\s+(table|view|index|trigger|function|procedure)\s+([A-Za-z_][\w.]*)", line, re.I)
+            if m:
+                add(line_no, level, m.group(1).lower(), m.group(2))
+                continue
+
+        m = re.match(r"^\s*(?:export\s+|public\s+|private\s+|protected\s+|internal\s+|open\s+|final\s+|abstract\s+|sealed\s+|data\s+|static\s+)*(class|interface|enum|struct|record|object|trait)\s+([A-Za-z_$][\w$]*)", line)
+        if m:
+            add(line_no, level, m.group(1), m.group(2))
+            continue
+        m = re.match(r"^\s*(?:export\s+|async\s+|suspend\s+|static\s+)*(func|fun|function|def|fn)\s+(?:\([^)]*\)\s*)?([A-Za-z_$][\w$]*)", line)
+        if m:
+            add(line_no, level, m.group(1), m.group(2))
+            continue
+        if lang_id in ("c", "cpp", "java", "csharp", "go", "rust", "swift", "kotlin"):
+            m = re.match(r"^\s*(?:[A-Za-z_$][\w$<>\[\],.?*&:\s]+\s+)+([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?:\{|=>)?\s*$", line)
+            if m and m.group(1) not in ("if", "for", "while", "switch", "catch"):
+                add(line_no, level, "method", m.group(1))
+
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -2197,18 +2268,22 @@ if TK_OK:
                 insertwidth=2, selectbackground=THEME["sel"],
                 selectforeground=THEME["fg"], padx=10, pady=8,
                 font=app.mono_font, spacing1=1, spacing3=1)
-            vsb = tk.Scrollbar(body, orient="vertical", command=self.text.yview)
+            self.vsb = tk.Scrollbar(body, orient="vertical",
+                                    command=self.text.yview, width=16)
             hsb = tk.Scrollbar(body, orient="horizontal", command=self.text.xview)
+            self._vscroll_visible = True
+            self._vscroll_dragging = False
             self.text.grid(row=0, column=0, sticky="nsew")
-            vsb.grid(row=0, column=1, sticky="ns")
+            self.vsb.grid(row=0, column=1, sticky="ns")
             hsb.grid(row=1, column=0, sticky="ew")
 
             def _yset(a, b):
-                vsb.set(a, b)
+                self.vsb.set(a, b)
                 self.gutter.schedule()
                 if len(self.get_text()) > 200000:
                     self._schedule("hl_view", 200, self.highlight_viewport)
             self.text.configure(yscrollcommand=_yset, xscrollcommand=hsb.set)
+            self._hide_vscroll()
             self.apply_font()
 
             self._config_tags()
@@ -2270,11 +2345,44 @@ if TK_OK:
             t.bind("<KeyPress-quotedbl>", lambda e: self._key_quote(e, '"'))
             t.bind("<KeyPress-apostrophe>", lambda e: self._key_quote(e, "'"))
             t.bind("<KeyPress-grave>", lambda e: self._key_quote(e, "`"))
+            t.bind("<Motion>", self._edge_scroll_motion)
+            t.bind("<Leave>", lambda e: self._hide_vscroll_later())
+            self.vsb.bind("<Enter>", lambda e: self._show_vscroll())
+            self.vsb.bind("<Leave>", lambda e: self._hide_vscroll_later())
+            self.vsb.bind("<ButtonPress-1>", self._vscroll_press)
+            self.vsb.bind("<ButtonRelease-1>", self._vscroll_release)
 
         def apply_font(self):
             sp = LANGS[self.lang]
             px = max(8, self.app.mono_font.measure("0") * sp["indent"])
             self.text.configure(font=self.app.mono_font, tabs=(px,))
+
+        def _show_vscroll(self):
+            if not self._vscroll_visible:
+                self.vsb.grid(row=0, column=1, sticky="ns")
+                self._vscroll_visible = True
+
+        def _hide_vscroll(self):
+            if self._vscroll_visible and not self._vscroll_dragging:
+                self.vsb.grid_remove()
+                self._vscroll_visible = False
+
+        def _hide_vscroll_later(self):
+            self._schedule("hide_vscroll", 650, self._hide_vscroll)
+
+        def _edge_scroll_motion(self, ev):
+            if ev.x >= max(0, self.text.winfo_width() - 28):
+                self._show_vscroll()
+            elif self._vscroll_visible and not self._vscroll_dragging:
+                self._hide_vscroll_later()
+
+        def _vscroll_press(self, ev):
+            self._vscroll_dragging = True
+            self._show_vscroll()
+
+        def _vscroll_release(self, ev):
+            self._vscroll_dragging = False
+            self._hide_vscroll_later()
 
         # ---- small helpers -------------------------------------------------
 
@@ -2324,6 +2432,8 @@ if TK_OK:
             self._schedule("hl_line", 50, self.highlight_line_now)
             self._schedule("hl_full", 400, self.highlight_all)
             self._schedule("check", 550, self.run_checks)
+            if getattr(self.app, "outline", None) and self.app.outline.visible:
+                self._schedule("outline", 750, self.app.refresh_outline_if_visible)
 
         def _on_modified(self, ev=None):
             if self._suppress:
@@ -2597,12 +2707,22 @@ if TK_OK:
                     changed += 1
             if changed:
                 t.edit_separator()
+                self._mark_dirty()
                 self.highlight_all()
                 self.run_checks(show_hint=False)
+                self.app.refresh_outline_if_visible()
             return changed
 
         def fix_all(self):
-            n = self.fix_issues(self.issues)
+            issues = self.issues
+            if not any(i.fix for i in issues):
+                try:
+                    issues = check_source(self.get_text(), self.lang,
+                                          self.path or self.title)
+                except Exception as ex:
+                    _log_error("fix_all_check_source", ex)
+                    issues = self.issues
+            n = self.fix_issues(issues)
             self.app.flash_status("Fixed %d issue%s" % (n, "" if n == 1 else "s")
                                   if n else "Nothing to fix here")
 
@@ -3081,6 +3201,7 @@ if TK_OK:
             self.highlight_all()
             self.run_checks(show_hint=False)
             self.app.update_status()
+            self.app.refresh_outline_if_visible()
 
     class OutputPanel(tk.Frame):
         """Run/Debug console with live output and an interactive stdin box."""
@@ -3390,6 +3511,92 @@ if TK_OK:
             tab.highlight_all()
             tab.run_checks(show_hint=False)
 
+    class OutlinePane(tk.Frame):
+        """Left-side source outline for fast jumps in large files."""
+
+        def __init__(self, master, app):
+            super().__init__(master, bg=THEME["bg_panel"], width=250)
+            self.app = app
+            self.visible = False
+            self.pack_propagate(False)
+            head = tk.Frame(self, bg=THEME["bg_panel"])
+            head.pack(fill="x")
+            tk.Label(head, text="OUTLINE", bg=THEME["bg_panel"],
+                     fg=THEME["fg_dim"], font=app.small_font)\
+                .pack(side="left", padx=(10, 6), pady=6)
+            FlatButton(head, "Refresh", self.refresh, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", pady=4)
+            FlatButton(head, "✕", self.hide, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", padx=(0, 4), pady=4)
+            wrap = tk.Frame(self, bg=THEME["bg_panel"])
+            wrap.pack(fill="both", expand=True)
+            self.canvas = tk.Canvas(wrap, bg=THEME["bg_panel"],
+                                    highlightthickness=0, bd=0)
+            self.scroll = tk.Scrollbar(wrap, orient="vertical",
+                                       command=self.canvas.yview)
+            self.inner = tk.Frame(self.canvas, bg=THEME["bg_panel"])
+            self.canvas.configure(yscrollcommand=self.scroll.set)
+            self.canvas.pack(side="left", fill="both", expand=True)
+            self.scroll.pack(side="right", fill="y")
+            self.window = self.canvas.create_window((0, 0), window=self.inner,
+                                                    anchor="nw")
+            self.inner.bind("<Configure>", lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")))
+            self.canvas.bind("<Configure>", lambda e:
+                             self.canvas.itemconfigure(self.window, width=e.width))
+
+        def show(self):
+            if not self.visible:
+                self.pack(side="left", fill="y", before=self.app.editor_area)
+                self.visible = True
+            self.refresh()
+
+        def hide(self):
+            if self.visible:
+                self.pack_forget()
+                self.visible = False
+
+        def toggle(self):
+            (self.hide if self.visible else self.show)()
+
+        def refresh(self):
+            for w in self.inner.winfo_children():
+                w.destroy()
+            tab = self.app.active_tab()
+            if not tab:
+                self._empty("Open a file to see its outline.")
+                return
+            items = outline_items(tab.get_text(), tab.lang)
+            if not items:
+                self._empty("No outline items in this file yet.")
+                return
+            for item in items:
+                self._row(tab, item)
+
+        def _empty(self, text):
+            tk.Label(self.inner, text=text, bg=THEME["bg_panel"],
+                     fg=THEME["fg_faint"], font=self.app.small_font,
+                     justify="left", wraplength=210)\
+                .pack(anchor="w", padx=12, pady=10)
+
+        def _row(self, tab, item):
+            row = tk.Frame(self.inner, bg=THEME["bg_panel"], cursor="hand2")
+            row.pack(fill="x", padx=4, pady=1)
+            pad = 8 + item.level * 14
+            text = "%4d  %s %s" % (item.line, item.kind, item.name)
+            lbl = tk.Label(row, text=text, anchor="w", bg=THEME["bg_panel"],
+                           fg=THEME["fg"], font=self.app.small_font,
+                           cursor="hand2", padx=pad, pady=3)
+            lbl.pack(fill="x")
+
+            def jump(ev=None, line=item.line, tb=tab):
+                self.app.activate(tb)
+                tb.goto_line(line)
+            for w in (row, lbl):
+                w.bind("<Button-1>", jump)
+                w.bind("<Enter>", lambda e, ww=w: ww.configure(bg=THEME["bg_hover"]))
+                w.bind("<Leave>", lambda e, ww=w: ww.configure(bg=THEME["bg_panel"]))
+
     class HomePane(tk.Frame):
         """Welcome screen: new file, open file, recent files."""
 
@@ -3542,6 +3749,9 @@ if TK_OK:
             FlatButton(right, "■ Stop", self.stop_run,
                        font=self.small_font, padx=10, pady=3)\
                 .pack(side="left", padx=3, pady=4)
+            FlatButton(self.topbar, "☰ Outline", self.toggle_outline,
+                       font=self.small_font, padx=10, pady=3)\
+                .pack(side="left", padx=(6, 3), pady=4)
             self.tabrow = tk.Frame(self.topbar, bg=THEME["bg_panel"])
             self.tabrow.pack(side="left", fill="x", expand=True)
 
@@ -3560,8 +3770,11 @@ if TK_OK:
 
             self.body = tk.Frame(self, bg=THEME["bg"])
             self.body.pack(side="top", fill="both", expand=True)
+            self.outline = OutlinePane(self.body, self)
+            self.editor_area = tk.Frame(self.body, bg=THEME["bg"])
+            self.editor_area.pack(side="left", fill="both", expand=True)
             self.findbar = FindBar(self, self)
-            self.home = HomePane(self.body, self)
+            self.home = HomePane(self.editor_area, self)
 
         def _build_status(self):
             s = self.status
@@ -3655,6 +3868,8 @@ if TK_OK:
             vm.add_separator()
             vm.add_command(label="Show/Hide Output", accelerator=acc("J"),
                            command=lambda: self.output.toggle())
+            vm.add_command(label="Show/Hide Outline", accelerator=acc("B"),
+                           command=self.toggle_outline)
             vm.add_command(label="Welcome Screen",
                            command=self.show_home_if_free)
             m.add_cascade(label="View", menu=vm)
@@ -3713,6 +3928,7 @@ if TK_OK:
             bind("l", self.goto_dialog)
             bind("slash", self.toggle_comment)
             bind("j", self.output.toggle)
+            bind("b", self.toggle_outline)
             bind("k", self.output.clear)
             bind("a", self.select_all)
             bind("A", self.toggle_autocheck)
@@ -3847,11 +4063,12 @@ if TK_OK:
                 self._active.pack_forget()
             self.home.pack_forget()
             self._active = tab
-            tab.pack(in_=self.body, fill="both", expand=True)
+            tab.pack(in_=self.editor_area, fill="both", expand=True)
             tab.text.focus_set()
             self.refresh_titles()
             self.update_status()
             self.update_issue_ui()
+            self.refresh_outline_if_visible()
             tab.gutter.schedule()
 
         def show_home(self):
@@ -3865,6 +4082,7 @@ if TK_OK:
             self.refresh_titles()
             self.update_status()
             self.update_issue_ui()
+            self.refresh_outline_if_visible()
 
         def show_home_if_free(self):
             if self._active is not None:
@@ -3910,7 +4128,7 @@ if TK_OK:
         def new_file(self, lang_id):
             sk = SKELETONS.get(lang_id, "")
             clean, spans = parse_placeholders(sk)
-            tab = EditorTab(self.body, self, lang=lang_id, content=clean,
+            tab = EditorTab(self.editor_area, self, lang=lang_id, content=clean,
                             placeholders=spans)
             self.add_tab(tab)
             self.flash_status("New %s file — %s saves it"
@@ -3951,7 +4169,7 @@ if TK_OK:
                                      parent=self)
                 return
             content = content.replace("\r\n", "\n").replace("\r", "\n")
-            tab = EditorTab(self.body, self, path=path, content=content)
+            tab = EditorTab(self.editor_area, self, path=path, content=content)
             self.add_tab(tab)
             self.add_recent(path)
             self.settings["last_dir"] = os.path.dirname(path)
@@ -4274,6 +4492,16 @@ if TK_OK:
         def hide_findbar(self):
             self.findbar.hide()
 
+        def toggle_outline(self):
+            if self.active_tab():
+                self.outline.toggle()
+            else:
+                self.flash_status("Open a file first")
+
+        def refresh_outline_if_visible(self):
+            if getattr(self, "outline", None) and self.outline.visible:
+                self.outline.refresh()
+
         # ---- running ----------------------------------------------------------
 
         def run_active(self, debug=False):
@@ -4491,6 +4719,7 @@ if TK_OK:
                 ("Un-indent", "⇧Tab"),
                 ("Find & replace", mod + "F"),
                 ("Fix all issues", "⇧" + mod + "F"),
+                ("Show/hide outline", mod + "B"),
                 ("Go to line", mod + "L"),
                 ("Toggle comment", mod + "/"),
                 ("Show/hide output", mod + "J"),
@@ -4695,6 +4924,15 @@ def selftest():
         assert detect_language("x.command") == "shell"
         assert detect_language(None, "#!/usr/bin/env node") == "javascript"
         assert detect_language("x.geskoext", '{"a": 1}') == "json"
+
+    def t_outline_items():
+        py = "class App:\n    def run(self):\n        pass\n\ndef main():\n    pass\n"
+        got = outline_items(py, "python")
+        assert [(i.line, i.kind, i.name) for i in got] == [
+            (1, "class", "App"), (2, "def", "run"), (5, "def", "main")
+        ], got
+        md = outline_items("# Title\n\n## Part\n", "markdown")
+        assert [i.name for i in md] == ["Title", "Part"], md
 
     def t_missing_colon():
         issues = check_source("if x\n", "python")
@@ -4936,6 +5174,7 @@ def selftest():
     run("rainbow bracket depths", t_rainbow)
     run("line index math", t_lineindex)
     run("language detection", t_detect)
+    run("outline extraction", t_outline_items)
     run("missing ':' detected + fixed", t_missing_colon)
     run("no false ':' positives", t_no_false_colon)
     run("unclosed '(' detected + fixed", t_unclosed_paren)
