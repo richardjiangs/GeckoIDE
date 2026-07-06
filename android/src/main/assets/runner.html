@@ -69,6 +69,89 @@ async function runPython(code) {
   }
 }
 
+async function checkPython(code) {
+  try {
+    const pyodide = await getPyodideRuntime();
+    pyodide.globals.set("__gesko_source__", code);
+    await pyodide.runPythonAsync('compile(__gesko_source__, "<geskoide>", "exec")');
+    send("check-ok", "Python syntax OK.\n");
+    send("check-done", "0");
+  } catch (err) {
+    send("check-err", "Python syntax error: " + (err && err.message ? err.message : err) + "\n");
+    send("check-done", "1");
+  }
+}
+
+async function debugPython(code) {
+  try {
+    const pyodide = await getPyodideRuntime();
+    pyodide.setStdout({ batched: (text) => send("out", text + "\n") });
+    pyodide.setStderr({ batched: (text) => send("err", text + "\n") });
+    pyodide.globals.set("__gesko_source__", code);
+    await pyodide.runPythonAsync(`
+import sys
+source = __gesko_source__
+lines = source.splitlines()
+
+def __gesko_trace(frame, event, arg):
+    if frame.f_code.co_filename == "<geskoide>" and event == "line":
+        lineno = frame.f_lineno
+        text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ""
+        print(f"[debug] line {lineno}: {text}")
+        visible = []
+        for key, value in frame.f_locals.items():
+            if key.startswith("__"):
+                continue
+            try:
+                visible.append(f"{key}={repr(value)[:80]}")
+            except Exception:
+                visible.append(f"{key}=<unprintable>")
+            if len(visible) >= 6:
+                break
+        if visible:
+            print("        locals: " + ", ".join(visible))
+    return __gesko_trace
+
+compiled = compile(source, "<geskoide>", "exec")
+globals_map = {"__name__": "__main__"}
+sys.settrace(__gesko_trace)
+try:
+    exec(compiled, globals_map, globals_map)
+finally:
+    sys.settrace(None)
+`);
+    send("done", "0");
+  } catch (err) {
+    send("err", (err && err.stack ? err.stack : err) + "\n");
+    send("done", "1");
+  }
+}
+
+async function checkJavaScript(code, mode) {
+  try {
+    const runnable = mode === "typescript" ? basicTypeScriptToJavaScript(code) : code;
+    new Function('"use strict"; return (async function(){\n' + runnable + '\n});');
+    send("check-ok", (mode === "typescript" ? "TypeScript" : "JavaScript") + " syntax OK.\n");
+    send("check-done", "0");
+  } catch (err) {
+    send("check-err", (mode === "typescript" ? "TypeScript" : "JavaScript")
+      + " syntax error: " + (err && err.message ? err.message : err) + "\n");
+    send("check-done", "1");
+  }
+}
+
+async function debugJavaScript(code, mode) {
+  const runnable = mode === "typescript" ? basicTypeScriptToJavaScript(code) : code;
+  send("debug", "Static line trace before execution:\n");
+  runnable.split(/\r?\n/).forEach((line, index) => {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith("//")) {
+      send("debug", "[debug] line " + (index + 1) + ": " + trimmed.slice(0, 140) + "\n");
+    }
+  });
+  await runJavaScript(code, mode);
+}
+
 async function runJavaScript(code, mode) {
   const originalConsole = window.console;
   const log = (kind, args) => send(kind, args.map((x) => {
@@ -105,6 +188,6 @@ async function runGo(code) {
   }
 }
 
-window.GeskoRunner = { runPython, runJavaScript, runGo };
+window.GeskoRunner = { runPython, checkPython, debugPython, runJavaScript, checkJavaScript, debugJavaScript, runGo };
 send("ready", "ready");
 </script>

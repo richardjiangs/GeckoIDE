@@ -102,6 +102,9 @@ public class MainActivity extends Activity {
     private Uri currentUri;
     private String currentName = "untitled.py";
     private Language currentLanguage;
+    private int pendingStaticIssues;
+    private int pendingRuntimeIssues;
+    private boolean runningDebug;
     private boolean dirty;
     private boolean highlighting;
 
@@ -178,6 +181,9 @@ public class MainActivity extends Activity {
         });
         addButton(tools, "Run", new View.OnClickListener() {
             @Override public void onClick(View v) { runActive(); }
+        });
+        addButton(tools, "Debug", new View.OnClickListener() {
+            @Override public void onClick(View v) { debugActive(); }
         });
 
         editor = new CodeEditor(this);
@@ -263,7 +269,8 @@ public class MainActivity extends Activity {
         updateStatus("Ready", ACCENT);
         output.setText("GeskoIDE Android Edition\n"
                 + languages.size() + " languages loaded from the original app.\n"
-                + "Run works offline for Python, Go, JavaScript, basic TypeScript, SQL, Shell, HTML, CSS, Markdown, and JSON.");
+                + "Run works offline for Python, Go, JavaScript, basic TypeScript, SQL, Shell, HTML, CSS, Markdown, and JSON.\n"
+                + "Check and Debug now run diagnostics for every language template.");
     }
 
     private void showTemplateMenu(View anchor) {
@@ -431,11 +438,24 @@ public class MainActivity extends Activity {
     }
 
     private void runActive() {
+        runActive(false);
+    }
+
+    private void debugActive() {
+        runActive(true);
+    }
+
+    private void runActive(boolean debug) {
         if (currentLanguage == null) currentLanguage = detectLanguage(currentName);
         String id = currentLanguage.id;
         String text = editor.getText().toString();
         output.setText("");
-        updateStatus("Running", INFO);
+        runningDebug = debug;
+        updateStatus(debug ? "Debugging" : "Running", INFO);
+        if (debug) {
+            debugActiveLanguage(id, text);
+            return;
+        }
         if ("python".equals(id)) {
             runInWebRuntime("python", text);
         } else if ("go".equals(id)) {
@@ -456,15 +476,34 @@ public class MainActivity extends Activity {
         } else if ("markdown".equals(id)) {
             showPreview("Markdown Preview", markdownToHtml(text));
         } else {
-            output.setText("No bundled runtime for " + currentLanguage.name + " in this APK build.\n"
-                    + "This is honest: GeskoIDE can edit, color, template, fix, and check this file, "
-                    + "but a real " + currentLanguage.name + " compiler/runtime is not bundled here.");
-            updateStatus("No runner", WARN);
+            output.setText(buildStaticDebugReport(text, currentLanguage.name + " static run check"));
+            appendOutput("info", "\nRun completed as a static check for " + currentLanguage.name
+                    + ". Use Debug for the symbol trace and diagnostics view.\n");
+            updateStatus("Static run check", INFO);
+        }
+    }
+
+    private void debugActiveLanguage(String id, String text) {
+        if ("python".equals(id)) {
+            runInWebRuntime("python-debug", text);
+        } else if ("javascript".equals(id) || "typescript".equals(id)) {
+            runInWebRuntime(id + "-debug", text);
+        } else if ("go".equals(id)) {
+            output.setText(buildStaticDebugReport(text, "Go static trace before bundled Yaegi run"));
+            runInWebRuntime("go-debug", text);
+        } else if ("sql".equals(id)) {
+            runSql(text, true);
+        } else if ("shell".equals(id)) {
+            runShell(text, true);
+        } else {
+            output.setText(buildStaticDebugReport(text, currentLanguage.name + " static debugger"));
+            updateStatus("Static debug", INFO);
         }
     }
 
     private void runInWebRuntime(final String mode, final String code) {
-        appendOutput("info", "$ run " + mode + " (bundled offline runtime)\n");
+        appendOutput("info", "$ " + (mode.endsWith("-debug") ? "debug " : "run ")
+                + mode.replace("-debug", "") + " (bundled offline runtime)\n");
         runnerWebView = new WebView(this);
         WebSettings settings = runnerWebView.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -478,8 +517,15 @@ public class MainActivity extends Activity {
                 String js;
                 if ("python".equals(mode)) {
                     js = "GeskoRunner.runPython(" + quotedCode + ")";
+                } else if ("python-debug".equals(mode)) {
+                    js = "GeskoRunner.debugPython(" + quotedCode + ")";
                 } else if ("go".equals(mode)) {
                     js = "GeskoRunner.runGo(" + quotedCode + ")";
+                } else if ("go-debug".equals(mode)) {
+                    js = "GeskoRunner.runGo(" + quotedCode + ")";
+                } else if ("javascript-debug".equals(mode) || "typescript-debug".equals(mode)) {
+                    String base = mode.replace("-debug", "");
+                    js = "GeskoRunner.debugJavaScript(" + quotedCode + "," + JSONObject.quote(base) + ")";
                 } else {
                     js = "GeskoRunner.runJavaScript(" + quotedCode + "," + JSONObject.quote(mode) + ")";
                 }
@@ -499,8 +545,32 @@ public class MainActivity extends Activity {
                 handler.post(new Runnable() {
                     @Override public void run() {
                         if ("ready".equals(kind)) return;
+                        if ("check-ok".equals(kind)) {
+                            appendOutput("info", message);
+                            return;
+                        }
+                        if ("check-err".equals(kind)) {
+                            pendingRuntimeIssues++;
+                            appendOutput("err", message);
+                            return;
+                        }
+                        if ("check-done".equals(kind)) {
+                            int total = pendingStaticIssues + pendingRuntimeIssues;
+                            if (total == 0) {
+                                appendOutput("info", "Runtime syntax passed.\n");
+                            }
+                            updateStatus(total == 0 ? "Clean" : total + " issue" + (total == 1 ? "" : "s"),
+                                    total == 0 ? ACCENT : WARN);
+                            return;
+                        }
+                        if ("debug".equals(kind)) {
+                            appendOutput("info", message);
+                            return;
+                        }
                         if ("done".equals(kind)) {
-                            updateStatus("0".equals(message) ? "Run finished" : "Run failed",
+                            String okText = runningDebug ? "Debug finished" : "Run finished";
+                            String failText = runningDebug ? "Debug failed" : "Run failed";
+                            updateStatus("0".equals(message) ? okText : failText,
                                     "0".equals(message) ? ACCENT : ERROR);
                         } else {
                             appendOutput(kind, message);
@@ -532,7 +602,11 @@ public class MainActivity extends Activity {
     }
 
     private void runSql(final String text) {
-        output.setText("$ run sql (Android SQLite)\n");
+        runSql(text, false);
+    }
+
+    private void runSql(final String text, final boolean debug) {
+        output.setText("$ " + (debug ? "debug" : "run") + " sql (Android SQLite)\n");
         new Thread(new Runnable() {
             @Override public void run() {
                 final StringBuilder result = new StringBuilder();
@@ -543,6 +617,18 @@ public class MainActivity extends Activity {
                     for (String stmt : splitSql(text)) {
                         String trimmed = stmt.trim();
                         if (trimmed.length() == 0) continue;
+                        if (debug) {
+                            result.append("[debug] statement: ").append(firstLine(trimmed)).append('\n');
+                            if (isQuery(trimmed)) {
+                                Cursor plan = db.rawQuery("EXPLAIN QUERY PLAN " + trimmed, null);
+                                try {
+                                    result.append("[debug] query plan\n");
+                                    appendCursor(result, plan);
+                                } finally {
+                                    plan.close();
+                                }
+                            }
+                        }
                         if (isQuery(trimmed)) {
                             Cursor c = db.rawQuery(trimmed, null);
                             try {
@@ -567,7 +653,11 @@ public class MainActivity extends Activity {
     }
 
     private void runShell(final String text) {
-        output.setText("$ /system/bin/sh script\n");
+        runShell(text, false);
+    }
+
+    private void runShell(final String text, final boolean debug) {
+        output.setText("$ /system/bin/sh " + (debug ? "-x " : "") + "script\n");
         new Thread(new Runnable() {
             @Override public void run() {
                 StringBuilder result = new StringBuilder();
@@ -577,8 +667,10 @@ public class MainActivity extends Activity {
                     FileOutputStream out = new FileOutputStream(script);
                     out.write(text.getBytes(StandardCharsets.UTF_8));
                     out.close();
-                    Process proc = new ProcessBuilder("/system/bin/sh", script.getAbsolutePath())
-                            .directory(getCacheDir()).redirectErrorStream(true).start();
+                    ProcessBuilder builder = debug
+                            ? new ProcessBuilder("/system/bin/sh", "-x", script.getAbsolutePath())
+                            : new ProcessBuilder("/system/bin/sh", script.getAbsolutePath());
+                    Process proc = builder.directory(getCacheDir()).redirectErrorStream(true).start();
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     InputStream in = proc.getInputStream();
                     long start = System.currentTimeMillis();
@@ -724,6 +816,13 @@ public class MainActivity extends Activity {
         if (isLang("python")) {
             fixed = fixPython(fixed);
         }
+        if (isCStyle(currentLanguage) || isLang("javascript") || isLang("typescript") || isLang("php")) {
+            fixed = fixAssignmentInConditions(fixed);
+            fixed = fixSimpleSemicolons(fixed);
+        }
+        if (isLang("css")) {
+            fixed = fixCssSemicolons(fixed);
+        }
         fixed = closeUnbalanced(fixed);
         if (!fixed.equals(text)) {
             editor.setText(fixed);
@@ -737,54 +836,70 @@ public class MainActivity extends Activity {
     }
 
     private void runChecks() {
+        if (currentLanguage == null) currentLanguage = detectLanguage(currentName);
         String text = editor.getText().toString();
         List<String> issues = new ArrayList<>();
         String[] lines = text.split("\n", -1);
-        int parens = 0;
-        int braces = 0;
-        int brackets = 0;
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i];
-            String trimmed = line.trim();
-            if (trimmed.startsWith("if ") || trimmed.startsWith("for ") || trimmed.startsWith("while ")
-                    || trimmed.startsWith("def ") || trimmed.startsWith("class ") || trimmed.startsWith("else")
-                    || trimmed.startsWith("elif ") || trimmed.startsWith("try") || trimmed.startsWith("except")
-                    || trimmed.startsWith("finally") || trimmed.startsWith("with ")) {
-                if (!trimmed.endsWith(":") && isLang("python")) {
-                    issues.add("line " + (i + 1) + ": missing ':'");
-                }
-            }
-            if (trimmed.startsWith("print ") && !trimmed.startsWith("print(") && isLang("python")) {
-                issues.add("line " + (i + 1) + ": Python 2 style print");
-            }
-            for (int j = 0; j < line.length(); j++) {
-                char ch = line.charAt(j);
-                if (ch == '(') parens++;
-                if (ch == ')') parens--;
-                if (ch == '{') braces++;
-                if (ch == '}') braces--;
-                if (ch == '[') brackets++;
-                if (ch == ']') brackets--;
-            }
+        if (text.contains("\u00ab\u00bb")) {
+            issues.add("line " + lineForOffset(text, text.indexOf("\u00ab\u00bb")) + ": template placeholder still needs code");
         }
-        if (parens > 0) issues.add("unclosed '('");
-        if (parens < 0) issues.add("extra ')'");
-        if (braces > 0) issues.add("unclosed '{'");
-        if (braces < 0) issues.add("extra '}'");
-        if (brackets > 0) issues.add("unclosed '['");
-        if (brackets < 0) issues.add("extra ']'");
-
+        checkGenericStructure(text, lines, issues);
         addLanguageChecks(text, lines, issues);
 
+        if (usesRuntimeSyntaxCheck()) {
+            checkInWebRuntime(currentLanguage.id, text, issues);
+        } else {
+            finishChecks(issues);
+        }
+    }
+
+    private void finishChecks(List<String> issues) {
+        output.setText(formatIssues(issues));
         if (issues.isEmpty()) {
-            output.setText("No checker issues found.\nUse Run to execute supported languages.");
+            appendOutput("info", "Static checks passed for " + currentLanguage.name + ".\n"
+                    + "Checked delimiters, strings, comments, and " + currentLanguage.name + " rules.\n");
             updateStatus("Clean", ACCENT);
         } else {
-            StringBuilder sb = new StringBuilder();
-            for (String issue : issues) sb.append(issue).append('\n');
-            output.setText(sb.toString());
             updateStatus(issues.size() + " issue" + (issues.size() == 1 ? "" : "s"), WARN);
         }
+    }
+
+    private String formatIssues(List<String> issues) {
+        if (issues.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String issue : issues) sb.append(issue).append('\n');
+        return sb.toString();
+    }
+
+    private boolean usesRuntimeSyntaxCheck() {
+        return isLang("python") || isLang("javascript") || isLang("typescript");
+    }
+
+    private void checkInWebRuntime(final String mode, final String code, List<String> staticIssues) {
+        pendingStaticIssues = staticIssues.size();
+        pendingRuntimeIssues = 0;
+        output.setText(formatIssues(staticIssues));
+        appendOutput("info", "$ check " + mode + " syntax (bundled runtime)\n");
+        runnerWebView = new WebView(this);
+        WebSettings settings = runnerWebView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setAllowFileAccess(true);
+        settings.setAllowFileAccessFromFileURLs(true);
+        settings.setAllowUniversalAccessFromFileURLs(true);
+        runnerWebView.addJavascriptInterface(new RunnerBridge(), "AndroidRunner");
+        runnerWebView.setWebViewClient(new WebViewClient() {
+            @Override public void onPageFinished(WebView view, String url) {
+                String quotedCode = JSONObject.quote(code);
+                String js;
+                if ("python".equals(mode)) {
+                    js = "GeskoRunner.checkPython(" + quotedCode + ")";
+                } else {
+                    js = "GeskoRunner.checkJavaScript(" + quotedCode + "," + JSONObject.quote(mode) + ")";
+                }
+                view.evaluateJavascript(js, null);
+            }
+        });
+        runnerWebView.loadUrl("file:///android_asset/runner.html");
     }
 
     private void highlight() {
@@ -983,18 +1098,507 @@ public class MainActivity extends Activity {
         return '}';
     }
 
+    private int lineForOffset(String text, int offset) {
+        int line = 1;
+        for (int i = 0; i < offset && i < text.length(); i++) {
+            if (text.charAt(i) == '\n') line++;
+        }
+        return line;
+    }
+
+    private void checkGenericStructure(String text, String[] lines, List<String> issues) {
+        Language lang = currentLanguage == null ? languageById("text") : currentLanguage;
+        ArrayDeque<SourcePos> stack = new ArrayDeque<>();
+        boolean inBlock = false;
+        String activeBlockEnd = "";
+        int blockLine = 0;
+        char quote = 0;
+        int quoteLine = 0;
+        boolean escaped = false;
+
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            int j = 0;
+            while (j < line.length()) {
+                if (inBlock) {
+                    int end = activeBlockEnd.length() == 0 ? -1 : line.indexOf(activeBlockEnd, j);
+                    if (end < 0) break;
+                    inBlock = false;
+                    j = end + activeBlockEnd.length();
+                    continue;
+                }
+                char ch = line.charAt(j);
+                if (quote != 0) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch == '\\') {
+                        escaped = true;
+                    } else if (ch == quote) {
+                        quote = 0;
+                    }
+                    j++;
+                    continue;
+                }
+                if (isLang("python") && (startsAt(line, j, "\"\"\"") || startsAt(line, j, "'''"))) {
+                    String mark = startsAt(line, j, "\"\"\"") ? "\"\"\"" : "'''";
+                    int end = line.indexOf(mark, j + 3);
+                    if (end < 0) {
+                        inBlock = true;
+                        activeBlockEnd = mark;
+                        blockLine = i + 1;
+                        break;
+                    }
+                    j = end + 3;
+                    continue;
+                }
+                if (lang.blockStart.length() > 0 && startsAt(line, j, lang.blockStart)) {
+                    inBlock = true;
+                    activeBlockEnd = lang.blockEnd;
+                    blockLine = i + 1;
+                    j += lang.blockStart.length();
+                    continue;
+                }
+                if (lang.lineComment.length() > 0 && startsAt(line, j, lang.lineComment)) {
+                    break;
+                }
+                if (isStringQuote(ch, lang)) {
+                    quote = ch;
+                    quoteLine = i + 1;
+                    escaped = false;
+                    j++;
+                    continue;
+                }
+                if (ch == '(' || ch == '[' || ch == '{') {
+                    stack.push(new SourcePos(ch, i + 1, j + 1));
+                } else if (ch == ')' || ch == ']' || ch == '}') {
+                    if (stack.isEmpty()) {
+                        issues.add("line " + (i + 1) + ": closing '" + ch + "' has no opener");
+                    } else {
+                        SourcePos open = stack.pop();
+                        if (matchingClose(open.ch) != ch) {
+                            issues.add("line " + (i + 1) + ": closing '" + ch
+                                    + "' does not match '" + open.ch + "' from line " + open.line);
+                        }
+                    }
+                }
+                j++;
+            }
+            if (quote != 0 && !(lang.backtick && quote == '`')) {
+                issues.add("line " + quoteLine + ": unterminated string literal");
+                quote = 0;
+            }
+        }
+        if (quote != 0) {
+            issues.add("line " + quoteLine + ": unterminated multiline string");
+        }
+        if (inBlock) {
+            issues.add("line " + blockLine + ": unclosed block comment/string");
+        }
+        while (!stack.isEmpty()) {
+            SourcePos open = stack.removeLast();
+            issues.add("line " + open.line + ": unclosed '" + open.ch + "'");
+        }
+    }
+
+    private boolean startsAt(String text, int index, String needle) {
+        return needle.length() > 0 && index + needle.length() <= text.length()
+                && text.regionMatches(index, needle, 0, needle.length());
+    }
+
+    private boolean isStringQuote(char ch, Language lang) {
+        return (ch == '"' && lang.strings.indexOf('"') >= 0)
+                || (ch == '\'' && lang.strings.indexOf('\'') >= 0)
+                || (ch == '`' && lang.backtick);
+    }
+
     private void addLanguageChecks(String text, String[] lines, List<String> issues) {
+        if (isLang("python")) checkPythonStatic(text, lines, issues);
+        if (isLang("javascript") || isLang("typescript")) checkJavaScriptStatic(lines, issues);
+        if (isCStyle(currentLanguage)) checkCStyleStatic(lines, issues);
+        if (isLang("go")) checkGoStatic(text, lines, issues);
+        if (isLang("rust")) checkRustStatic(lines, issues);
+        if (isLang("css")) checkCss(lines, issues);
+        if (isLang("sql")) checkSql(text, issues);
         if (isLang("json")) checkJson(text, issues);
         if (isLang("html")) checkHtml(text, issues);
         if (isLang("java")) checkJava(text, issues);
         if (isLang("shell")) checkShell(lines, issues);
-        if (isLang("yaml")) {
-            for (int i = 0; i < lines.length; i++) {
-                if (lines[i].startsWith("\t")) {
-                    issues.add("line " + (i + 1) + ": YAML indentation should use spaces, not tabs");
+        if (isLang("yaml")) checkYaml(lines, issues);
+        if (isLang("ruby")) checkEndBlocks(lines, "Ruby", "\\b(def|class|module|if|unless|case|begin|do)\\b", "\\bend\\b", issues);
+        if (isLang("lua")) checkEndBlocks(lines, "Lua", "\\b(function|if|for|while|do)\\b", "\\b(end|until)\\b", issues);
+        if (isLang("applescript")) checkEndBlocks(lines, "AppleScript", "\\b(tell|if|repeat|try)\\b", "\\bend\\b", issues);
+    }
+
+    private void checkPythonStatic(String text, String[] lines, List<String> issues) {
+        for (int i = 0; i < lines.length; i++) {
+            String code = beforeLineComment(lines[i], "#");
+            String trimmed = code.trim();
+            if (trimmed.length() == 0) continue;
+            String indent = leadingWhitespace(lines[i]);
+            if (indent.indexOf('\t') >= 0 && indent.indexOf(' ') >= 0) {
+                issues.add("line " + (i + 1) + ": mixed tabs and spaces in indentation");
+            }
+            if (isPythonBlockHeader(trimmed) && !trimmed.endsWith(":") && !trimmed.endsWith("\\")) {
+                issues.add("line " + (i + 1) + ": missing ':' after Python block header");
+            }
+            if (trimmed.matches("print\\s+[^()].*")) {
+                issues.add("line " + (i + 1) + ": Python 2 style print; use print(...)");
+            }
+            if ((trimmed.startsWith("if ") || trimmed.startsWith("elif ") || trimmed.startsWith("while "))
+                    && hasSingleEquals(trimmed)) {
+                issues.add("line " + (i + 1) + ": assignment '=' inside condition; did you mean '=='?");
+            }
+            if (trimmed.matches("from\\s+\\S+\\s+import\\s+\\*")) {
+                issues.add("line " + (i + 1) + ": wildcard import makes undefined-name checks weaker");
+            }
+            if ("except:".equals(trimmed)) {
+                issues.add("line " + (i + 1) + ": bare except catches everything");
+            }
+        }
+    }
+
+    private boolean isPythonBlockHeader(String trimmed) {
+        return trimmed.matches("(async\\s+)?(def|class|if|elif|else|for|while|try|except|finally|with)\\b.*");
+    }
+
+    private void checkJavaScriptStatic(String[] lines, List<String> issues) {
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = beforeLineComment(lines[i], "//").trim();
+            if (trimmed.length() == 0) continue;
+            if (startsControlWithCondition(trimmed) && hasSingleEquals(trimmed)) {
+                issues.add("line " + (i + 1) + ": assignment '=' inside condition; did you mean '==' or '==='?");
+            }
+            if (trimmed.matches("(let|const|var)\\s+[A-Za-z_$][\\w$]*\\s*=\\s*;?")) {
+                issues.add("line " + (i + 1) + ": variable assignment is missing a value");
+            }
+            if (isLang("typescript") && trimmed.matches("(interface|type|enum)\\b.*") && !trimmed.endsWith("{")
+                    && !trimmed.endsWith(";") && !trimmed.contains("=")) {
+                issues.add("line " + (i + 1) + ": TypeScript declaration looks incomplete");
+            }
+        }
+    }
+
+    private void checkCStyleStatic(String[] lines, List<String> issues) {
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = beforeLineComment(lines[i], "//").trim();
+            if (trimmed.length() == 0 || trimmed.startsWith("*")) continue;
+            if (startsControlWithCondition(trimmed) && hasSingleEquals(trimmed)) {
+                issues.add("line " + (i + 1) + ": assignment '=' inside condition; did you mean equality?");
+            }
+            if (needsSemicolon(currentLanguage) && looksLikeMissingSemicolon(trimmed)) {
+                issues.add("line " + (i + 1) + ": statement may be missing ';'");
+            }
+        }
+    }
+
+    private void checkGoStatic(String text, String[] lines, List<String> issues) {
+        if (!Pattern.compile("(?m)^\\s*package\\s+[A-Za-z_][A-Za-z0-9_]*").matcher(text).find()) {
+            issues.add("line 1: Go files need a package declaration");
+        }
+        if (Pattern.compile("(?m)^\\s*package\\s+main\\b").matcher(text).find()
+                && !Pattern.compile("(?m)^\\s*func\\s+main\\s*\\(").matcher(text).find()) {
+            issues.add("line 1: package main usually needs func main()");
+        }
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = beforeLineComment(lines[i], "//").trim();
+            if (trimmed.startsWith("func ") && !trimmed.contains("{")) {
+                issues.add("line " + (i + 1) + ": Go function header is missing '{'");
+            }
+        }
+    }
+
+    private void checkRustStatic(String[] lines, List<String> issues) {
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = beforeLineComment(lines[i], "//").trim();
+            if (trimmed.startsWith("fn ") && !trimmed.contains("{")) {
+                issues.add("line " + (i + 1) + ": Rust function header is missing '{'");
+            }
+            if (trimmed.startsWith("let ") && !trimmed.endsWith(";") && !trimmed.endsWith("{")) {
+                issues.add("line " + (i + 1) + ": Rust let statement may be missing ';'");
+            }
+        }
+    }
+
+    private void checkCss(String[] lines, List<String> issues) {
+        boolean inside = false;
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = lines[i].trim();
+            if (trimmed.length() == 0 || trimmed.startsWith("/*") || trimmed.startsWith("*")) continue;
+            if (trimmed.contains("{")) inside = true;
+            if (inside && !trimmed.contains("{") && !trimmed.contains("}") && !trimmed.startsWith("@")) {
+                if (!trimmed.contains(":")) {
+                    issues.add("line " + (i + 1) + ": CSS declaration needs property: value");
+                } else if (!trimmed.endsWith(";")) {
+                    issues.add("line " + (i + 1) + ": CSS declaration may be missing ';'");
+                }
+            }
+            if (trimmed.contains("}")) inside = false;
+        }
+    }
+
+    private void checkSql(String text, List<String> issues) {
+        SQLiteDatabase db = null;
+        try {
+            db = SQLiteDatabase.create(null);
+            for (String stmt : splitSql(text)) {
+                String trimmed = stmt.trim();
+                if (trimmed.length() == 0) continue;
+                if (isQuery(trimmed)) {
+                    Cursor c = db.rawQuery("EXPLAIN QUERY PLAN " + trimmed, null);
+                    c.close();
+                } else {
+                    db.execSQL(trimmed);
+                }
+            }
+        } catch (Exception ex) {
+            issues.add("SQL check: " + ex.getMessage());
+        } finally {
+            if (db != null) db.close();
+        }
+    }
+
+    private void checkYaml(String[] lines, List<String> issues) {
+        int previousIndent = 0;
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            if (trimmed.length() == 0 || trimmed.startsWith("#")) continue;
+            if (line.startsWith("\t")) {
+                issues.add("line " + (i + 1) + ": YAML indentation should use spaces, not tabs");
+            }
+            int indent = leadingWhitespace(line).length();
+            if (indent % 2 != 0) {
+                issues.add("line " + (i + 1) + ": YAML indentation is odd; two-space steps are safer");
+            }
+            if (indent > previousIndent + 2) {
+                issues.add("line " + (i + 1) + ": YAML indentation jumps more than one level");
+            }
+            previousIndent = indent;
+        }
+    }
+
+    private void checkEndBlocks(String[] lines, String name, String openRegex, String closeRegex, List<String> issues) {
+        Pattern open = Pattern.compile(openRegex);
+        Pattern close = Pattern.compile(closeRegex);
+        int depth = 0;
+        int firstOpen = 0;
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = lines[i].trim();
+            if (trimmed.length() == 0 || trimmed.startsWith("#") || trimmed.startsWith("--")) continue;
+            if (open.matcher(trimmed).find()) {
+                if (depth == 0) firstOpen = i + 1;
+                depth++;
+            }
+            if (close.matcher(trimmed).find()) {
+                depth--;
+                if (depth < 0) {
+                    issues.add("line " + (i + 1) + ": " + name + " has an extra end/close token");
+                    depth = 0;
                 }
             }
         }
+        if (depth > 0) {
+            issues.add("line " + firstOpen + ": " + name + " block may be missing end");
+        }
+    }
+
+    private boolean startsControlWithCondition(String trimmed) {
+        return trimmed.startsWith("if") || trimmed.startsWith("while")
+                || trimmed.startsWith("switch");
+    }
+
+    private boolean hasSingleEquals(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) != '=') continue;
+            char prev = i > 0 ? text.charAt(i - 1) : 0;
+            char next = i + 1 < text.length() ? text.charAt(i + 1) : 0;
+            if (prev != '=' && prev != '!' && prev != '<' && prev != '>' && prev != ':' && next != '=' && next != '>') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String beforeLineComment(String line, String marker) {
+        if (marker == null || marker.length() == 0) return line;
+        int idx = line.indexOf(marker);
+        return idx < 0 ? line : line.substring(0, idx);
+    }
+
+    private String leadingWhitespace(String line) {
+        int i = 0;
+        while (i < line.length() && Character.isWhitespace(line.charAt(i)) && line.charAt(i) != '\n') i++;
+        return line.substring(0, i);
+    }
+
+    private boolean isCStyle(Language lang) {
+        if (lang == null) return false;
+        return "c".equals(lang.id) || "cpp".equals(lang.id) || "csharp".equals(lang.id)
+                || "java".equals(lang.id) || "javascript".equals(lang.id) || "typescript".equals(lang.id)
+                || "kotlin".equals(lang.id) || "swift".equals(lang.id) || "php".equals(lang.id)
+                || "perl".equals(lang.id);
+    }
+
+    private boolean needsSemicolon(Language lang) {
+        if (lang == null) return false;
+        return "c".equals(lang.id) || "cpp".equals(lang.id) || "csharp".equals(lang.id)
+                || "java".equals(lang.id) || "php".equals(lang.id) || "perl".equals(lang.id);
+    }
+
+    private boolean looksLikeMissingSemicolon(String trimmed) {
+        if (trimmed.endsWith(";") || trimmed.endsWith("{") || trimmed.endsWith("}") || trimmed.endsWith(":")
+                || trimmed.startsWith("#") || trimmed.startsWith("@")) {
+            return false;
+        }
+        if (trimmed.matches("(if|for|while|switch|catch|else|try|finally|class|struct|enum|interface|namespace)\\b.*")) {
+            return false;
+        }
+        return trimmed.matches("(return|break|continue|throw|import|package|using|echo|print)\\b.*")
+                || trimmed.matches(".*\\b(int|long|short|float|double|char|bool|boolean|String|string|var|auto)\\b\\s+[A-Za-z_$][\\w$]*.*")
+                || trimmed.matches("[$A-Za-z_][\\w$]*(\\.[A-Za-z_][\\w$]*|\\[[^]]*\\])*\\s*=.*")
+                || trimmed.matches("[A-Za-z_][\\w$]*\\s*\\([^;{}]*\\)");
+    }
+
+    private String fixAssignmentInConditions(String text) {
+        String[] lines = text.split("\n", -1);
+        StringBuilder out = new StringBuilder(text.length());
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            if (startsControlWithCondition(trimmed) && hasSingleEquals(trimmed)) {
+                line = replaceFirstSingleEquals(line);
+            }
+            out.append(line);
+            if (i < lines.length - 1) out.append('\n');
+        }
+        return out.toString();
+    }
+
+    private String replaceFirstSingleEquals(String line) {
+        for (int i = 0; i < line.length(); i++) {
+            if (line.charAt(i) != '=') continue;
+            char prev = i > 0 ? line.charAt(i - 1) : 0;
+            char next = i + 1 < line.length() ? line.charAt(i + 1) : 0;
+            if (prev != '=' && prev != '!' && prev != '<' && prev != '>' && prev != ':' && next != '=' && next != '>') {
+                return line.substring(0, i) + "==" + line.substring(i + 1);
+            }
+        }
+        return line;
+    }
+
+    private String fixSimpleSemicolons(String text) {
+        if (!needsSemicolon(currentLanguage)) return text;
+        String[] lines = text.split("\n", -1);
+        StringBuilder out = new StringBuilder(text.length() + lines.length);
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = beforeLineComment(line, currentLanguage.lineComment).trim();
+            if (looksLikeMissingSemicolon(trimmed)) {
+                line = line + ";";
+            }
+            out.append(line);
+            if (i < lines.length - 1) out.append('\n');
+        }
+        return out.toString();
+    }
+
+    private String fixCssSemicolons(String text) {
+        String[] lines = text.split("\n", -1);
+        boolean inside = false;
+        StringBuilder out = new StringBuilder(text.length() + lines.length);
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            if (trimmed.contains("{")) inside = true;
+            if (inside && trimmed.contains(":") && !trimmed.endsWith(";")
+                    && !trimmed.endsWith("{") && !trimmed.contains("}")) {
+                line = line + ";";
+            }
+            if (trimmed.contains("}")) inside = false;
+            out.append(line);
+            if (i < lines.length - 1) out.append('\n');
+        }
+        return out.toString();
+    }
+
+    private String buildStaticDebugReport(String text, String title) {
+        List<String> issues = new ArrayList<>();
+        String[] lines = text.split("\n", -1);
+        checkGenericStructure(text, lines, issues);
+        addLanguageChecks(text, lines, issues);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("$ debug ").append(currentLanguage.name).append(" (").append(title).append(")\n");
+        sb.append("Static trace, symbols, and diagnostics. This does not install anything.\n\n");
+        sb.append("Symbols / sections\n");
+        List<String> symbols = collectSymbols(lines);
+        if (symbols.isEmpty()) {
+            sb.append("  line 1: top-level file\n");
+        } else {
+            for (String symbol : symbols) sb.append("  ").append(symbol).append('\n');
+        }
+        sb.append("\nExecutable-looking lines\n");
+        int count = 0;
+        for (int i = 0; i < lines.length && count < 80; i++) {
+            String trimmed = beforeLineComment(lines[i], currentLanguage.lineComment).trim();
+            if (trimmed.length() == 0 || trimmed.endsWith("{") || trimmed.endsWith("}")) continue;
+            sb.append("  line ").append(i + 1).append(": ").append(firstLine(trimmed)).append('\n');
+            count++;
+        }
+        if (count == 0) sb.append("  none found\n");
+        sb.append("\nDiagnostics\n");
+        if (issues.isEmpty()) {
+            sb.append("  no static issues found\n");
+        } else {
+            for (String issue : issues) sb.append("  ").append(issue).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private List<String> collectSymbols(String[] lines) {
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = lines[i].trim();
+            String item = symbolForLine(trimmed);
+            if (item != null) out.add("line " + (i + 1) + ": " + item);
+            if (out.size() >= 120) break;
+        }
+        return out;
+    }
+
+    private String symbolForLine(String trimmed) {
+        Matcher m;
+        if (isLang("python")) {
+            m = Pattern.compile("^(def|class)\\s+([A-Za-z_][\\w]*)").matcher(trimmed);
+            if (m.find()) return m.group(1) + " " + m.group(2);
+        }
+        if (isLang("javascript") || isLang("typescript")) {
+            m = Pattern.compile("^(?:export\\s+)?(?:async\\s+)?function\\s+([A-Za-z_$][\\w$]*)").matcher(trimmed);
+            if (m.find()) return "function " + m.group(1);
+            m = Pattern.compile("^(?:export\\s+)?class\\s+([A-Za-z_$][\\w$]*)").matcher(trimmed);
+            if (m.find()) return "class " + m.group(1);
+        }
+        if (isLang("go")) {
+            m = Pattern.compile("^func\\s+(?:\\([^)]*\\)\\s*)?([A-Za-z_][\\w]*)").matcher(trimmed);
+            if (m.find()) return "func " + m.group(1);
+        }
+        if (isLang("rust")) {
+            m = Pattern.compile("^(fn|struct|enum|impl)\\s+([A-Za-z_][\\w]*)?").matcher(trimmed);
+            if (m.find()) return m.group(1) + (m.group(2) == null ? "" : " " + m.group(2));
+        }
+        if (isLang("sql")) {
+            m = Pattern.compile("(?i)^create\\s+(table|view|index|trigger|function|procedure)\\s+([A-Za-z_][\\w.]*)").matcher(trimmed);
+            if (m.find()) return m.group(1).toLowerCase(Locale.US) + " " + m.group(2);
+        }
+        if (isLang("markdown") && trimmed.startsWith("#")) {
+            return trimmed.replaceFirst("^#+\\s*", "section ");
+        }
+        if (isLang("css") && trimmed.endsWith("{")) {
+            return "selector " + trimmed.substring(0, trimmed.length() - 1).trim();
+        }
+        m = Pattern.compile("^(class|struct|interface|enum|fun|func|function|def|sub)\\s+([A-Za-z_$][\\w$]*)").matcher(trimmed);
+        if (m.find()) return m.group(1) + " " + m.group(2);
+        return null;
     }
 
     private void checkJson(String text, List<String> issues) {
@@ -1127,6 +1731,18 @@ public class MainActivity extends Activity {
 
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private static class SourcePos {
+        final char ch;
+        final int line;
+        final int col;
+
+        SourcePos(char ch, int line, int col) {
+            this.ch = ch;
+            this.line = line;
+            this.col = col;
+        }
     }
 
     private static class Language {
