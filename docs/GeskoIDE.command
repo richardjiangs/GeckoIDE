@@ -1,0 +1,5261 @@
+#!/bin/sh
+''''command -v python3 >/dev/null 2>&1 && exec python3 "$0" "$@" # '''
+''''echo "GeskoIDE needs Python 3. On macOS run:  xcode-select --install   (free, one time) or install Python 3 from python.org, then open GeskoIDE.command again." >&2; exit 127 # '''
+"""
+GeskoIDE - a fast, friendly, fully offline code editor for macOS (and Linux/Windows).
+
+This single file is simultaneously a valid POSIX shell script and a Python 3
+program: double-clicking GeskoIDE.command on macOS opens Terminal, the two
+shell lines above hand the file to the system's python3, and the rest of the
+file is the whole application.
+
+Design goals
+  * Zero dependencies: Python 3.8+ standard library only (tkinter for the UI).
+  * Zero network: no APIs, no telemetry, no downloads. Everything is local.
+  * Friendly: welcome screen, skeleton templates for new files, automatic
+    hints while typing, Tab auto-complete / auto-fix, one-key Run and Debug.
+  * Original look: the "Gecko Dark" color theme is designed from scratch for
+    GeskoIDE (it is not a copy of any other editor's licensed theme).
+
+Command line:
+  GeskoIDE.command [files...]     open files
+  GeskoIDE.command --selftest     run the built-in test suite (no GUI needed)
+  GeskoIDE.command --version      print version
+"""
+
+import ast
+import builtins as _builtins
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import queue as _queue
+import webbrowser
+from bisect import bisect_right
+from collections import Counter, namedtuple
+
+APP = "GeskoIDE"
+VERSION = "1.3.0"
+IS_MAC = (sys.platform == "darwin")
+IS_WIN = (sys.platform == "win32")
+
+# Silence the "system Tk is deprecated" banner from Apple's bundled Tk 8.5.
+os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+
+
+def augment_path():
+    """Make sure common tool locations are on PATH (Homebrew, /usr/local)."""
+    extra = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/go/bin",
+             os.path.expanduser("~/.cargo/bin"), "/usr/bin", "/bin"]
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    for p in extra:
+        if os.path.isdir(p) and p not in parts:
+            parts.append(p)
+    os.environ["PATH"] = os.pathsep.join(parts)
+
+
+augment_path()
+
+
+def settings_dir():
+    if IS_MAC:
+        d = os.path.expanduser("~/Library/Application Support/GeskoIDE")
+    elif IS_WIN:
+        d = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GeskoIDE")
+    else:
+        d = os.path.join(os.environ.get("XDG_CONFIG_HOME",
+                                        os.path.expanduser("~/.config")), "geskoide")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = tempfile.gettempdir()
+    return d
+
+
+def _log_error(where, exc):
+    """Append an unexpected error to a local log so problems are diagnosable
+    (still 100% offline - it just writes a file next to the settings)."""
+    import traceback
+    try:
+        with open(os.path.join(settings_dir(), "error.log"), "a",
+                  encoding="utf-8") as f:
+            f.write("[%s] %s\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                       where, traceback.format_exc()))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Theme: "Gecko Dark" - an original palette made for GeskoIDE.
+# --------------------------------------------------------------------------
+
+THEME = {
+    "bg":           "#0f1512",   # window chrome
+    "bg_panel":     "#131b17",   # side panels / bars
+    "bg_editor":    "#0e1411",   # text area
+    "bg_gutter":    "#0c110f",   # line-number gutter
+    "bg_status":    "#18231d",   # status bar
+    "bg_hover":     "#1d2a23",
+    "bg_active":    "#24352c",
+    "bg_input":     "#16201b",
+    "border":       "#233129",
+    "fg":           "#d7e3db",
+    "fg_dim":       "#7f9187",
+    "fg_faint":     "#54655c",
+    "accent":       "#3fd68f",   # gecko green
+    "accent_dark":  "#2a9463",
+    "caret":        "#3fd68f",
+    "sel":          "#2b5140",
+    "current_line": "#151f19",
+    "find_match":   "#3d5a2a",
+    "brk_match":    "#3a5a4a",
+    "error":        "#ff6b6b",
+    "warn":         "#ffc857",
+    "info":         "#6fb7ff",
+    "ok":           "#3fd68f",
+}
+
+# Every token class gets its own color, so literally every word on screen is
+# colored. (Original palette - not derived from any other editor.)
+TOKEN_COLORS = {
+    "keyword":   "#45d38a",
+    "type":      "#58c7d8",
+    "builtin":   "#6cb8e8",
+    "func":      "#bcd96c",
+    "cls":       "#e8c766",
+    "const":     "#f08fb1",
+    "string":    "#e6a06c",
+    "number":    "#d99fe8",
+    "comment":   "#5f7566",
+    "decorator": "#e07a5f",
+    "preproc":   "#e07a5f",
+    "op":        "#7fd8c0",
+    "punct":     "#95a89c",
+    "ident":     "#d7e3db",
+    "var":       "#9fd0b5",
+    "brk0":      "#e0b458",
+    "brk1":      "#c17ee0",
+    "brk2":      "#5fb7e8",
+    # Markdown / prose extras
+    "heading":   "#45d38a",
+    "bold":      "#e8c766",
+    "italic":    "#9fd0b5",
+    "link":      "#6cb8e8",
+    "codeblock": "#e6a06c",
+}
+TOKEN_BOLD = {"keyword", "heading", "bold", "cls"}
+TOKEN_ITALIC = {"comment", "italic", "decorator"}
+
+
+# --------------------------------------------------------------------------
+# Language definitions
+# --------------------------------------------------------------------------
+
+def _lang(name, exts, **kw):
+    d = dict(
+        name=name, exts=exts,
+        line_comment=None,          # e.g. "#"
+        block_comment=None,         # e.g. ("/*", "*/")
+        strings="\"'",              # quote characters
+        triple=False,               # python-style triple quotes
+        backtick=False,             # js template strings
+        str_prefix=False,           # python r"" f"" prefixes
+        keywords="", types="", builtins="", constants="",
+        preproc=None,               # regex for preprocessor lines
+        decorator=None,             # regex for decorators / annotations
+        extra=(),                   # [(token_type, regex), ...] highest priority
+        ci=False,                   # case-insensitive keywords
+        indent=4, indent_char=" ",
+        family=None,                # snippet family (defaults to language id)
+        run=None,                   # runner id (defaults to language id)
+    )
+    d.update(kw)
+    for k in ("keywords", "types", "builtins", "constants"):
+        d[k] = set(d[k].split())
+    return d
+
+
+LANGS = {}
+
+LANGS["python"] = _lang(
+    "Python", [".py", ".pyw"],
+    line_comment="#", triple=True, str_prefix=True,
+    decorator=r"^[ \t]*@[\w.]+",
+    keywords="and as assert async await break class continue def del elif else"
+             " except finally for from global if import in is lambda match case"
+             " nonlocal not or pass raise return try while with yield",
+    constants="True False None Ellipsis NotImplemented __name__ __main__ __file__ __doc__",
+    builtins="print len range open input int float str bool list dict set tuple"
+             " type isinstance issubclass super object enumerate zip map filter"
+             " sorted reversed sum min max abs round divmod pow any all repr"
+             " format vars dir id hash iter next getattr setattr hasattr delattr"
+             " callable staticmethod classmethod property exec eval compile"
+             " globals locals bytes bytearray frozenset complex ord chr hex oct"
+             " bin slice breakpoint exit quit self cls",
+    types="Exception BaseException ValueError TypeError KeyError IndexError"
+          " RuntimeError StopIteration OSError IOError AttributeError NameError"
+          " ZeroDivisionError ArithmeticError NotImplementedError ImportError"
+          " ModuleNotFoundError FileNotFoundError PermissionError TimeoutError"
+          " UnicodeError OverflowError RecursionError SyntaxError IndentationError"
+          " KeyboardInterrupt SystemExit List Dict Set Tuple Optional Union Any"
+          " Callable Iterable Iterator Sequence Mapping",
+)
+
+LANGS["javascript"] = _lang(
+    "JavaScript", [".js", ".mjs", ".cjs", ".jsx"],
+    line_comment="//", block_comment=("/*", "*/"), backtick=True,
+    decorator=r"@\w+", indent=2,
+    keywords="break case catch class const continue debugger default delete do"
+             " else export extends finally for function if import in instanceof"
+             " let new of return static super switch this throw try typeof var"
+             " void while with yield async await get set",
+    constants="true false null undefined NaN Infinity globalThis",
+    types="Array Object String Number Boolean Symbol BigInt Map Set WeakMap"
+          " WeakSet Date RegExp Promise Error TypeError RangeError SyntaxError"
+          " JSON Math Proxy Reflect Intl",
+    builtins="console log warn error info document window parseInt parseFloat"
+             " isNaN isFinite alert prompt confirm setTimeout setInterval"
+             " clearTimeout clearInterval fetch require module exports process"
+             " structuredClone queueMicrotask encodeURIComponent decodeURIComponent",
+    family="clike", run="node",
+)
+
+LANGS["typescript"] = _lang(
+    "TypeScript", [".ts", ".tsx", ".mts", ".cts"],
+    line_comment="//", block_comment=("/*", "*/"), backtick=True,
+    decorator=r"@\w+", indent=2,
+    keywords=LANGS["javascript"]["keywords"] and
+             "break case catch class const continue debugger default delete do"
+             " else export extends finally for function if import in instanceof"
+             " let new of return static super switch this throw try typeof var"
+             " void while with yield async await get set type interface enum"
+             " namespace declare readonly abstract implements private public"
+             " protected keyof infer satisfies override as is module",
+    constants="true false null undefined NaN Infinity globalThis",
+    types="string number boolean object symbol bigint void never unknown any"
+          " Array Object String Number Boolean Map Set Date RegExp Promise Error"
+          " Record Partial Required Readonly Pick Omit Exclude Extract"
+          " ReturnType Parameters Awaited JSON Math",
+    builtins=LANGS["javascript"]["builtins"] and
+             "console log warn error info document window parseInt parseFloat"
+             " isNaN isFinite alert prompt confirm setTimeout setInterval"
+             " clearTimeout clearInterval fetch require module exports process",
+    family="clike", run="typescript",
+)
+
+LANGS["html"] = _lang(
+    "HTML", [".html", ".htm", ".xhtml"],
+    block_comment=("<!--", "-->"), indent=2,
+    extra=(
+        ("preproc", r"<![A-Za-z][^>]*>"),
+        ("keyword", r"</?[A-Za-z][A-Za-z0-9-]*|/?>"),
+        ("type", r"\b[a-zA-Z-]+(?=[ \t]*=)"),
+        ("const", r"&#?[a-zA-Z0-9]+;"),
+    ),
+    family="html", run="html",
+)
+
+LANGS["css"] = _lang(
+    "CSS", [".css", ".scss", ".less"],
+    block_comment=("/*", "*/"), indent=2,
+    extra=(
+        ("decorator", r"@[\w-]+"),
+        ("number", r"#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|vmin|vmax|%|s|ms|fr|deg|pt|ch|ex)\b"),
+        ("func", r"[\w-]+(?=\()"),
+        ("builtin", r"[\w-]+(?=[ \t]*:)"),
+        ("type", r"[.#][\w-]+"),
+        ("const", r"!important\b"),
+    ),
+    family="css", run="css",
+)
+
+LANGS["json"] = _lang(
+    "JSON", [".json", ".jsonc", ".geojson"],
+    line_comment="//", indent=2,
+    constants="true false null",
+    family="json", run="json",
+)
+
+LANGS["markdown"] = _lang(
+    "Markdown", [".md", ".markdown"],
+    strings="", indent=2,
+    extra=(
+        ("codeblock", r"(?s:^```.*?(?:^```[ \t]*$|\Z))"),
+        ("string", r"`[^`\n]+`"),
+        ("heading", r"^#{1,6}[^\n]*$"),
+        ("bold", r"\*\*[^*\n]+\*\*|__[^_\n]+__"),
+        ("italic", r"\*[^*\n]+\*|\b_[^_\n]+_\b"),
+        ("link", r"!?\[[^\]\n]*\]\([^)\n]*\)|<https?://[^>\n]+>"),
+        ("keyword", r"^[ \t]*(?:[-*+]|\d+\.)[ \t]"),
+        ("comment", r"^>[^\n]*$"),
+        ("op", r"^(?:---+|\*\*\*+|===+)[ \t]*$"),
+    ),
+    family="markdown", run="markdown",
+)
+
+LANGS["c"] = _lang(
+    "C", [".c", ".h"],
+    line_comment="//", block_comment=("/*", "*/"),
+    preproc=r"^[ \t]*#[ \t]*\w+",
+    keywords="auto break case const continue default do else enum extern for"
+             " goto if inline register restrict return sizeof static struct"
+             " switch typedef union volatile while",
+    types="char double float int long short signed unsigned void _Bool bool"
+          " size_t ssize_t wchar_t FILE va_list int8_t int16_t int32_t int64_t"
+          " uint8_t uint16_t uint32_t uint64_t intptr_t uintptr_t ptrdiff_t",
+    constants="NULL EOF stdin stdout stderr true false INT_MAX INT_MIN SIZE_MAX",
+    builtins="printf scanf fprintf sprintf snprintf malloc calloc realloc free"
+             " memcpy memmove memset strlen strcpy strncpy strcmp strncmp strcat"
+             " strchr strstr fopen fclose fread fwrite fgets fputs puts putchar"
+             " getchar exit abort assert perror qsort bsearch atoi atof strtol"
+             " strtod rand srand time main",
+    family="clike", run="c",
+)
+
+LANGS["cpp"] = _lang(
+    "C++", [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
+    line_comment="//", block_comment=("/*", "*/"),
+    preproc=r"^[ \t]*#[ \t]*\w+",
+    keywords="alignas alignof asm auto break case catch class concept const"
+             " consteval constexpr constinit const_cast continue decltype"
+             " default delete do dynamic_cast else enum explicit export extern"
+             " final for friend goto if inline mutable namespace new noexcept"
+             " operator override private protected public reinterpret_cast"
+             " requires return sizeof static static_assert static_cast struct"
+             " switch template this thread_local throw try typedef typeid"
+             " typename union using virtual volatile while co_await co_return"
+             " co_yield",
+    types="bool char char8_t char16_t char32_t double float int long short"
+          " signed unsigned void wchar_t size_t string wstring string_view"
+          " vector map set unordered_map unordered_set list deque array pair"
+          " tuple shared_ptr unique_ptr weak_ptr optional variant any function"
+          " iostream istream ostream stringstream span",
+    constants="NULL nullptr true false EOF stdin stdout stderr npos",
+    builtins="std cout cin cerr clog endl flush getline make_shared make_unique"
+             " make_pair make_tuple move forward swap sort stable_sort find"
+             " find_if count count_if for_each transform accumulate min max"
+             " min_element max_element reverse unique lower_bound upper_bound"
+             " begin end rbegin rend push_back pop_back emplace emplace_back"
+             " size length empty clear insert erase at front back top push pop"
+             " get first second to_string stoi stol stod substr c_str data"
+             " printf scanf fprintf sprintf snprintf puts putchar getchar malloc"
+             " calloc realloc free memcpy memset strlen strcmp strcpy fopen"
+             " fclose exit abort assert main",
+    family="clike", run="cpp",
+)
+
+LANGS["csharp"] = _lang(
+    "C#", [".cs"],
+    line_comment="//", block_comment=("/*", "*/"),
+    decorator=r"^[ \t]*\[[\w.()\", =]+\]",
+    keywords="abstract as base break case catch checked class const continue"
+             " default delegate do else enum event explicit extern finally"
+             " fixed for foreach goto if implicit in interface internal is lock"
+             " namespace new operator out override params private protected"
+             " public readonly ref return sealed sizeof stackalloc static"
+             " struct switch this throw try typeof unchecked unsafe using var"
+             " virtual void volatile while async await record init required get set",
+    types="bool byte char decimal double float int long object sbyte short"
+          " string uint ulong ushort String Int32 Int64 Double Boolean List"
+          " Dictionary Task Action Func Console Object Exception DateTime"
+          " TimeSpan Guid IEnumerable",
+    constants="true false null",
+    builtins="WriteLine Write ReadLine Parse ToString Length Count Add Remove"
+             " Contains Select Where First Last OrderBy Main",
+    family="clike", run="csharp",
+)
+
+LANGS["java"] = _lang(
+    "Java", [".java"],
+    line_comment="//", block_comment=("/*", "*/"),
+    decorator=r"@\w+",
+    keywords="abstract assert break case catch class const continue default do"
+             " else enum extends final finally for goto if implements import"
+             " instanceof interface native new package private protected public"
+             " return static strictfp super switch synchronized this throw"
+             " throws transient try void volatile while record sealed permits"
+             " var yield",
+    types="boolean byte char double float int long short String Integer Long"
+          " Double Float Boolean Character Byte Short Object List ArrayList Map"
+          " HashMap Set HashSet Optional Stream Exception RuntimeException"
+          " Thread Runnable StringBuilder Scanner Math System",
+    constants="true false null",
+    builtins="println print printf out err main toString equals hashCode"
+             " length size get put add remove contains valueOf parseInt format",
+    family="clike", run="java",
+)
+
+LANGS["go"] = _lang(
+    "Go", [".go"],
+    line_comment="//", block_comment=("/*", "*/"), backtick=True,
+    indent=4, indent_char="\t",
+    keywords="break case chan const continue default defer else fallthrough"
+             " for func go goto if import interface map package range return"
+             " select struct switch type var",
+    types="bool byte complex64 complex128 error float32 float64 int int8 int16"
+          " int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr any"
+          " comparable",
+    constants="true false nil iota",
+    builtins="append cap close copy delete imag len make new panic print"
+             " println real recover fmt Println Printf Sprintf Errorf main",
+    family="clike", run="go",
+)
+
+LANGS["rust"] = _lang(
+    "Rust", [".rs"],
+    line_comment="//", block_comment=("/*", "*/"),
+    decorator=r"#!?\[[^\]\n]*\]",
+    keywords="as async await break const continue crate dyn else enum extern"
+             " fn for if impl in let loop match mod move mut pub ref return"
+             " self Self static struct super trait type union unsafe use where"
+             " while",
+    types="bool char f32 f64 i8 i16 i32 i64 i128 isize str u8 u16 u32 u64 u128"
+          " usize String Vec Option Result Box Rc Arc RefCell HashMap HashSet"
+          " BTreeMap Cow PathBuf Path",
+    constants="true false Some None Ok Err",
+    builtins="println print format vec panic assert assert_eq dbg todo"
+             " unimplemented unwrap expect iter collect map filter push pop len"
+             " clone into from new default main",
+    family="clike", run="rust",
+)
+
+LANGS["ruby"] = _lang(
+    "Ruby", [".rb", ".rake", ".gemspec"],
+    line_comment="#", indent=2,
+    extra=(("comment", r"(?ms:^=begin.*?^=end[ \t]*$)"),
+           ("const", r"(?m::\w+)"),
+           ("var", r"[@$]{1,2}\w+")),
+    keywords="BEGIN END alias and begin break case class def do else elsif end"
+             " ensure for if in module next not or redo rescue retry return"
+             " self super then undef unless until when while yield require"
+             " require_relative include extend raise lambda proc loop"
+             " attr_accessor attr_reader attr_writer defined",
+    constants="true false nil __FILE__ __LINE__ ARGV ENV",
+    builtins="puts print p gets chomp to_s to_i to_f to_sym map each select"
+             " reject reduce inject times upto downto push pop length size new"
+             " inspect freeze dup call join split first last sort reverse",
+    family="ruby", run="ruby",
+)
+
+LANGS["php"] = _lang(
+    "PHP", [".php"],
+    line_comment="//", block_comment=("/*", "*/"),
+    extra=(("var", r"\$\w+"), ("preproc", r"<\?php|\?>"), ("decorator", r"#\[[^\]\n]*\]")),
+    keywords="abstract and array as break callable case catch class clone const"
+             " continue declare default do echo else elseif empty enum extends"
+             " final finally fn for foreach function global goto if implements"
+             " include include_once instanceof insteadof interface isset list"
+             " match namespace new or print private protected public readonly"
+             " require require_once return static switch throw trait try unset"
+             " use var while xor yield",
+    constants="true false null TRUE FALSE NULL PHP_EOL __DIR__ __FILE__",
+    types="int float string bool object mixed void iterable self parent",
+    builtins="strlen count array_map array_filter array_merge array_keys"
+             " array_values implode explode str_replace substr sprintf printf"
+             " var_dump print_r json_encode json_decode file_get_contents"
+             " file_put_contents preg_match preg_replace in_array is_array"
+             " is_string is_int die exit",
+    family="clike", run="php",
+)
+
+LANGS["shell"] = _lang(
+    "Shell", [".sh", ".bash", ".zsh", ".command"],
+    line_comment="#", indent=2,
+    extra=(("var", r"\$\{[^}\n]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@#?*!$-]"),),
+    keywords="if then else elif fi for while until do done case esac in"
+             " function select time break continue return exit export local"
+             " readonly declare typeset set unset shift trap source alias eval"
+             " exec wait",
+    builtins="echo printf read cd pwd ls cp mv rm mkdir rmdir touch cat grep"
+             " sed awk cut sort uniq head tail tr wc find xargs which test kill"
+             " jobs fg bg sleep date basename dirname chmod chown curl tar env"
+             " sudo tee open pbcopy pbpaste osascript brew git python3 pip3",
+    constants="true false",
+    family="shell", run="shell",
+)
+
+LANGS["swift"] = _lang(
+    "Swift", [".swift"],
+    line_comment="//", block_comment=("/*", "*/"),
+    decorator=r"@\w+",
+    keywords="associatedtype class deinit enum extension fileprivate func"
+             " import init inout internal let open operator private protocol"
+             " public rethrows static struct subscript typealias var break case"
+             " continue default defer do else fallthrough for guard if in"
+             " repeat return switch where while as catch is throw throws try"
+             " await async actor some any lazy weak unowned mutating override"
+             " required convenience final indirect",
+    types="Int Int8 Int16 Int32 Int64 UInt Double Float Bool String Character"
+          " Array Dictionary Set Optional Any AnyObject Void Error Result Data"
+          " URL Date Range ClosedRange",
+    constants="true false nil self Self super",
+    builtins="print debugPrint dump min max abs map filter reduce compactMap"
+             " flatMap sorted count append insert remove contains isEmpty first"
+             " last joined split hasPrefix hasSuffix readLine",
+    family="clike", run="swift",
+)
+
+LANGS["kotlin"] = _lang(
+    "Kotlin", [".kt", ".kts"],
+    line_comment="//", block_comment=("/*", "*/"),
+    decorator=r"@\w+",
+    keywords="as break class continue do else for fun if in interface is"
+             " object package return super this throw try typealias val var"
+             " when while by catch constructor delegate finally get import init"
+             " set where abstract annotation companion const data enum final"
+             " infix inline inner internal lateinit open operator out override"
+             " private protected public reified sealed suspend vararg",
+    types="Int Long Short Byte Double Float Boolean Char String Unit Any"
+          " Nothing List MutableList Map MutableMap Set MutableSet Array"
+          " IntArray Pair Triple Sequence",
+    constants="true false null",
+    builtins="println print listOf mutableListOf mapOf mutableMapOf setOf"
+             " arrayOf let also apply run with takeIf takeUnless lazy require"
+             " check error TODO toString map filter forEach first last main",
+    family="clike", run="kotlin",
+)
+
+LANGS["lua"] = _lang(
+    "Lua", [".lua"],
+    line_comment="--", block_comment=("--[[", "]]"), indent=2,
+    keywords="and break do else elseif end for function goto if in local not"
+             " or repeat return then until while",
+    constants="true false nil _G self",
+    builtins="print pairs ipairs next type tostring tonumber pcall xpcall"
+             " error assert select unpack require setmetatable getmetatable"
+             " rawget rawset string table math io os coroutine load dofile",
+    family="lua", run="lua",
+)
+
+LANGS["sql"] = _lang(
+    "SQL", [".sql"],
+    line_comment="--", block_comment=("/*", "*/"), ci=True, indent=2,
+    keywords="select from where insert into values update delete set create"
+             " table view index drop alter add primary key foreign references"
+             " not null unique default check constraint join inner left right"
+             " full outer on as and or in is between like limit offset order by"
+             " group having distinct union all exists case when then else end"
+             " begin commit rollback transaction if trigger procedure function"
+             " returns return declare cascade asc desc",
+    types="int integer smallint bigint decimal numeric float real double"
+          " precision char varchar text blob boolean date time timestamp"
+          " datetime serial uuid json jsonb",
+    constants="null true false",
+    builtins="count sum avg min max coalesce nullif cast abs round upper lower"
+             " length substr trim replace now current_date current_timestamp"
+             " random group_concat printf date datetime strftime",
+    family="sql", run="sql",
+)
+
+LANGS["yaml"] = _lang(
+    "YAML", [".yml", ".yaml"],
+    line_comment="#", indent=2, ci=True,
+    extra=(("keyword", r"^(?:---|\.\.\.)[ \t]*$"),
+           ("builtin", r"^[ \t]*(?:- )?[\w.\/-]+(?=[ \t]*:(?:[ \t]|$))"),
+           ("decorator", r"[&*][\w-]+|![\w!\/]+")),
+    constants="true false null yes no on off",
+    family="yaml", run="yaml",
+)
+
+LANGS["applescript"] = _lang(
+    "AppleScript", [".applescript", ".scpt"],
+    line_comment="--", block_comment=("(*", "*)"), ci=True,
+    keywords="on end tell to set if then else else if repeat with times"
+             " from exit return try error considering ignoring of the my its"
+             " it me as property script global local run open activate and or"
+             " not is in contains equal greater less than",
+    constants="true false missing value pi result current application",
+    builtins="display dialog alert say count get first last item items"
+             " paragraph paragraphs word words character characters delay beep"
+             " choose file log",
+    family="applescript", run="applescript",
+)
+
+LANGS["perl"] = _lang(
+    "Perl", [".pl", ".pm"],
+    line_comment="#",
+    extra=(("var", r"[\$\@\%]\w+"),),
+    keywords="use strict warnings my our local sub if elsif else unless while"
+             " until for foreach do last next redo return package require qw"
+             " eq ne lt gt le ge cmp and or not xor",
+    constants="undef __FILE__ __LINE__ STDIN STDOUT STDERR",
+    builtins="print printf say chomp chop push pop shift unshift splice sort"
+             " reverse keys values each exists delete defined scalar wantarray"
+             " die warn open close split join map grep sprintf length substr"
+             " index uc lc ucfirst lcfirst",
+    family="ruby", run="perl",
+)
+
+LANGS["text"] = _lang("Plain Text", [".txt", ".log", ".cfg", ".ini", ".conf"],
+                      line_comment="#", family="text", run="text")
+
+# Preferred order for the "New File" chooser.
+LANG_ORDER = ["python", "javascript", "typescript", "html", "css", "json",
+              "markdown", "c", "cpp", "java", "csharp", "go", "rust", "swift",
+              "kotlin", "ruby", "php", "shell", "lua", "sql", "yaml",
+              "applescript", "perl", "text"]
+
+LANG_BY_EXT = {}
+for _lid in LANGS:
+    for _e in LANGS[_lid]["exts"]:
+        LANG_BY_EXT.setdefault(_e, _lid)
+
+SHEBANG_MAP = [("python", "python"), ("node", "javascript"), ("bash", "shell"),
+               ("zsh", "shell"), ("sh", "shell"), ("ruby", "ruby"),
+               ("perl", "perl"), ("php", "php"), ("osascript", "applescript"),
+               ("lua", "lua")]
+
+
+def detect_language(path=None, first_line=""):
+    """Guess the language id from a file path and/or its first line."""
+    if path:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".command":
+            pass  # decide by shebang below; plain .command is shell
+        elif ext in LANG_BY_EXT:
+            return LANG_BY_EXT[ext]
+    if first_line.startswith("#!"):
+        for probe, lid in SHEBANG_MAP:
+            if probe in first_line:
+                return lid
+    if path and os.path.splitext(path)[1].lower() == ".command":
+        return "shell"
+    if first_line.strip().startswith(("<!DOCTYPE", "<html")):
+        return "html"
+    if first_line.strip().startswith(("{", "[")):
+        return "json"
+    return "text"
+
+
+# --------------------------------------------------------------------------
+# New-file skeletons.
+# Pure structure, no example code. «label» marks a placeholder the user can
+# type over; «» marks where the caret lands. Press Tab to hop between them.
+# --------------------------------------------------------------------------
+
+SKELETONS = {
+    "python": '#!/usr/bin/env python3\n"""«What this program does.»"""\n\n\n'
+              'def main():\n    «»\n\n\nif __name__ == "__main__":\n    main()\n',
+    "javascript": '"use strict";\n\nfunction main() {\n  «»\n}\n\nmain();\n',
+    "typescript": 'function main(): void {\n  «»\n}\n\nmain();\n',
+    "html": '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+            '  <meta charset="UTF-8">\n'
+            '  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+            '  <title>«Page title»</title>\n</head>\n<body>\n  «»\n</body>\n</html>\n',
+    "css": '/* «What this stylesheet is for.» */\n\nbody {\n  «»\n}\n',
+    "json": '{\n  «»\n}\n',
+    "markdown": '# «Title»\n\n«»\n',
+    "c": '#include <stdio.h>\n#include <stdlib.h>\n\n'
+         'int main(int argc, char *argv[]) {\n    «»\n    return 0;\n}\n',
+    "cpp": '#include <iostream>\n#include <string>\n#include <vector>\n\n'
+           'int main(int argc, char *argv[]) {\n    «»\n    return 0;\n}\n',
+    "csharp": 'using System;\n\nclass Program {\n'
+              '    static void Main(string[] args) {\n        «»\n    }\n}\n',
+    "java": 'public class Main {\n'
+            '    public static void main(String[] args) {\n        «»\n    }\n}\n',
+    "go": 'package main\n\nfunc main() {\n\t«»\n}\n',
+    "rust": 'fn main() {\n    «»\n}\n',
+    "swift": 'import Foundation\n\n«»\n',
+    "kotlin": 'fun main() {\n    «»\n}\n',
+    "ruby": '#!/usr/bin/env ruby\n# frozen_string_literal: true\n\n'
+            'def main\n  «»\nend\n\nmain if __FILE__ == $PROGRAM_NAME\n',
+    "php": '<?php\n\n«»\n',
+    "shell": '#!/usr/bin/env bash\nset -euo pipefail\n\n'
+             'main() {\n  «»\n}\n\nmain "$@"\n',
+    "lua": 'local function main()\n  «»\nend\n\nmain()\n',
+    "sql": '-- «What this query does.»\n\n«»\n',
+    "yaml": '# «What this file configures.»\n\n«»\n',
+    "applescript": 'on run\n\t«»\nend run\n',
+    "perl": '#!/usr/bin/env perl\nuse strict;\nuse warnings;\n\n«»\n',
+    "text": '«»\n',
+}
+
+# --------------------------------------------------------------------------
+# Tab-expandable snippets ("type the keyword, press Tab").
+# "\t" means one indent unit; "\n" lines are re-indented to the caret's level.
+# --------------------------------------------------------------------------
+
+SNIPPETS = {
+    "python": {
+        "if": "if «condition»:\n\t«»",
+        "elif": "elif «condition»:\n\t«»",
+        "else": "else:\n\t«»",
+        "for": "for «item» in «iterable»:\n\t«»",
+        "while": "while «condition»:\n\t«»",
+        "def": "def «name»(«args»):\n\t«»",
+        "class": "class «Name»:\n\tdef __init__(self):\n\t\t«»",
+        "try": "try:\n\t«»\nexcept «Exception» as exc:\n\traise",
+        "with": "with «expression» as «name»:\n\t«»",
+        "main": 'def main():\n\t«»\n\nif __name__ == "__main__":\n\tmain()',
+    },
+    "clike": {
+        "if": "if («condition») {\n\t«»\n}",
+        "else": "else {\n\t«»\n}",
+        "for": "for (int i = 0; i < «n»; i++) {\n\t«»\n}",
+        "while": "while («condition») {\n\t«»\n}",
+        "switch": "switch («value») {\ncase «a»:\n\t«»\n\tbreak;\ndefault:\n\tbreak;\n}",
+        "function": "function «name»(«args») {\n\t«»\n}",
+        "func": "func «name»(«args») {\n\t«»\n}",
+        "try": "try {\n\t«»\n} catch («err») {\n\t«»\n}",
+        "do": "do {\n\t«»\n} while («condition»);",
+    },
+    "shell": {
+        "if": "if [ «condition» ]; then\n\t«»\nfi",
+        "for": "for «x» in «list»; do\n\t«»\ndone",
+        "while": "while «condition»; do\n\t«»\ndone",
+        "case": "case «$var» in\n«pattern»)\n\t«»\n\t;;\nesac",
+        "func": "«name»() {\n\t«»\n}",
+    },
+    "ruby": {
+        "if": "if «condition»\n\t«»\nend",
+        "def": "def «name»\n\t«»\nend",
+        "each": "«list».each do |«item»|\n\t«»\nend",
+        "class": "class «Name»\n\t«»\nend",
+        "while": "while «condition»\n\t«»\nend",
+    },
+    "lua": {
+        "if": "if «condition» then\n\t«»\nend",
+        "for": "for i = 1, «n» do\n\t«»\nend",
+        "while": "while «condition» do\n\t«»\nend",
+        "function": "local function «name»(«args»)\n\t«»\nend",
+    },
+    "sql": {
+        "select": "select «columns»\nfrom «table»\nwhere «condition»;",
+    },
+    "applescript": {
+        "if": "if «condition» then\n\t«»\nend if",
+        "repeat": "repeat «n» times\n\t«»\nend repeat",
+        "tell": 'tell application "«App»"\n\t«»\nend tell',
+    },
+}
+
+PLACEHOLDER_RE = re.compile(r"«([^«»\n]*)»")
+
+
+def parse_placeholders(s):
+    """Strip «...» markers. Return (clean_text, [(start, end), ...])."""
+    spans = []
+    clean = []
+    pos = 0
+    removed = 0
+    for m in PLACEHOLDER_RE.finditer(s):
+        clean.append(s[pos:m.start()])
+        start = m.start() - removed
+        label = m.group(1)
+        clean.append(label)
+        spans.append((start, start + len(label)))
+        removed += 2
+        pos = m.end()
+    clean.append(s[pos:])
+    return "".join(clean), spans
+
+
+def indent_unit(sp):
+    return "\t" if sp["indent_char"] == "\t" else " " * sp["indent"]
+
+
+# --------------------------------------------------------------------------
+# Tokenizer: one master regex per language, then word classification.
+# --------------------------------------------------------------------------
+
+_LEXERS = {}
+
+
+def get_lexer(lang_id):
+    got = _LEXERS.get(lang_id)
+    if got:
+        return got
+    sp = LANGS[lang_id]
+    alts = []
+    ttmap = {}
+
+    def add(tt, pat):
+        name = "g%d" % len(ttmap)
+        ttmap[name] = tt
+        alts.append("(?P<%s>%s)" % (name, pat))
+
+    for tt, pat in sp["extra"]:
+        add(tt, pat)
+    if sp["block_comment"]:
+        o, c = sp["block_comment"]
+        add("comment", re.escape(o) + r"(?s:.*?)(?:" + re.escape(c) + r"|\Z)")
+    if sp["line_comment"]:
+        add("comment", re.escape(sp["line_comment"]) + r"[^\n]*")
+    pref = r"[rRbBuUfF]{0,2}" if sp["str_prefix"] else ""
+    if sp["triple"]:
+        add("string",
+            pref + r"(?:'''(?s:.*?)(?:'''|\Z)|\"\"\"(?s:.*?)(?:\"\"\"|\Z))")
+    if sp["backtick"]:
+        add("string", r"`(?s:(?:\\.|[^`\\])*)(?:`|\Z)")
+    for q in sp["strings"]:
+        add("string",
+            pref + q + r"(?:\\.|[^\\" + q + r"\n])*(?:" + q + r"|$)")
+    if sp["preproc"]:
+        add("preproc", sp["preproc"])
+    if sp["decorator"]:
+        add("decorator", sp["decorator"])
+    add("number",
+        r"\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+"
+        r"|(?:\d[\d_]*(?:\.\d[\d_]*)?|\.\d[\d_]+)(?:[eE][+-]?\d+)?)[jJfFlLuUnm]*")
+    add("word", r"[A-Za-z_][A-Za-z0-9_]*")
+    add("brk", r"[\[\](){}]")
+    add("op", r"[-+*/%=<>!&|^~?@\\]+")
+    add("punct", r"[.,:;]+")
+    rx = re.compile("|".join(alts), re.M)
+    got = (rx, ttmap, sp)
+    _LEXERS[lang_id] = got
+    return got
+
+
+def tokenize(text, lang_id):
+    """Return [(start, end, token_type), ...] for the whole text."""
+    rx, ttmap, sp = get_lexer(lang_id)
+    kw = sp["keywords"]
+    types = sp["types"]
+    consts = sp["constants"]
+    bins = sp["builtins"]
+    ci = sp["ci"]
+    out = []
+    n = len(text)
+    for m in rx.finditer(text):
+        tt = ttmap[m.lastgroup]
+        s, e = m.span()
+        if s == e:
+            continue
+        if tt == "word":
+            w = m.group()
+            lw = w.lower() if ci else w
+            if lw in kw:
+                tt = "keyword"
+            elif lw in types:
+                tt = "type"
+            elif lw in consts:
+                tt = "const"
+            elif lw in bins:
+                tt = "builtin"
+            else:
+                j = e
+                while j < n and text[j] in " \t":
+                    j += 1
+                if j < n and text[j] == "(":
+                    tt = "func"
+                elif len(w) > 1 and w.isupper():
+                    tt = "const"
+                elif w[:1].isupper():
+                    tt = "cls"
+                else:
+                    tt = "ident"
+        out.append((s, e, tt))
+    return out
+
+
+class LineIndex:
+    """Maps absolute character offsets to (line, col) / Tk 'line.col' indexes."""
+
+    def __init__(self, text):
+        starts = [0]
+        pos = text.find("\n")
+        while pos != -1:
+            starts.append(pos + 1)
+            pos = text.find("\n", pos + 1)
+        self.starts = starts
+
+    def line_col(self, off):
+        ln = bisect_right(self.starts, off)
+        return ln, off - self.starts[ln - 1]
+
+    def tk(self, off):
+        ln, col = self.line_col(off)
+        return "%d.%d" % (ln, col)
+
+
+BRK_PAIR = {"(": ")", "[": "]", "{": "}"}
+BRK_MATCH = {")": "(", "]": "[", "}": "{"}
+
+
+def scan_brackets(text, tokens):
+    """Walk bracket tokens (strings/comments excluded because they arrive as
+    single tokens). Returns:
+      retype:   {token_index: "brk0|1|2"}  rainbow depth colors
+      unclosed: [(offset, char)] opens never closed (in stack order)
+      stray:    [(offset, char)] closes with nothing to close
+      events:   [(offset, +1|-1)] depth change events, in order
+    """
+    retype = {}
+    unclosed = []
+    stray = []
+    events = []
+    stack = []
+    for i, tok in enumerate(tokens):
+        s, e, tt = tok
+        if tt != "brk":
+            continue
+        ch = text[s:e]
+        if ch in BRK_PAIR:
+            retype[i] = "brk%d" % (len(stack) % 3)
+            stack.append((s, ch))
+            events.append((s, 1))
+        else:
+            if stack and stack[-1][1] == BRK_MATCH[ch]:
+                stack.pop()
+                retype[i] = "brk%d" % (len(stack) % 3)
+                events.append((s, -1))
+            elif stack:
+                stray.append((s, ch))
+                stack.pop()
+                retype[i] = "brk%d" % (len(stack) % 3)
+                events.append((s, -1))
+            else:
+                retype[i] = "brk0"
+                stray.append((s, ch))
+    unclosed.extend(stack)
+    return retype, unclosed, stray, events
+
+
+def depth_at_line_starts(line_starts, events):
+    """Bracket nesting depth at the start of every line (0-indexed list)."""
+    depths = []
+    d = 0
+    j = 0
+    for ls in line_starts:
+        while j < len(events) and events[j][0] < ls:
+            d += events[j][1]
+            j += 1
+        depths.append(d)
+    return depths
+
+
+# --------------------------------------------------------------------------
+# Auto-check: find problems, describe them kindly, and know how to fix them.
+# --------------------------------------------------------------------------
+
+Issue = namedtuple("Issue", "line col end severity msg fix")
+# line: 1-based, col/end: 0-based columns, severity: error|warn|info,
+# fix: (kind, data) or None.
+OutlineItem = namedtuple("OutlineItem", "line level kind name")
+
+SEV_ORDER = {"error": 0, "warn": 1, "info": 2}
+
+COMPOUND_PY = {"if", "elif", "else", "for", "while", "def", "class", "try",
+               "except", "finally", "with"}
+CLIKE_SEMI_LANGS = {"c", "cpp", "java", "csharp"}
+SEMI_SKIP_START = {"if", "else", "for", "while", "switch", "do", "case",
+                   "default", "try", "catch", "finally", "template",
+                   "namespace", "using", "public", "private", "protected"}
+NO_BRACKET_CHECK = {"markdown", "text"}
+
+
+def split_code_comment(line, lc):
+    """Split a single line into (code, comment) respecting quotes."""
+    if not lc:
+        return line, ""
+    q = None
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "\"'":
+            q = c
+        elif line.startswith(lc, i):
+            return line[:i], line[i:]
+        i += 1
+    return line, ""
+
+
+def _masked(text, li, ln, ltoks, line_text):
+    """Line text with string/comment tokens blanked out."""
+    start = li.starts[ln - 1]
+    buf = list(line_text)
+    for s, e, tt in ltoks:
+        if tt in ("string", "comment", "codeblock"):
+            for k in range(max(s, start), min(e, start + len(buf))):
+                buf[k - start] = " "
+    return "".join(buf)
+
+
+def check_source(text, lang_id, filename=None, max_issues=40, heuristics=True):
+    """Analyze source, return a list of Issue tuples (sorted, capped).
+
+    heuristics=False skips the guess-based checks (missing ';', '=' in a
+    condition) - used when a real compiler is available to lint this language,
+    since the compiler reports those precisely and the guesses only add noise.
+    """
+    sp = LANGS[lang_id]
+    issues = []
+    error_lines = set()
+
+    def add(line, col, end, sev, msg, fix=None):
+        issues.append(Issue(line, col, max(end, col), sev, msg, fix))
+        if sev == "error":
+            error_lines.add(line)
+
+    tokens = tokenize(text, lang_id)
+    li = LineIndex(text)
+    lines = text.split("\n")
+    retype, unclosed, stray, events = scan_brackets(text, tokens)
+    depths = depth_at_line_starts(li.starts, events)
+    # Depth counting only () and [] - a curly brace opens a block, not a
+    # statement continuation, so it must not gate the semicolon check.
+    paren_events = [(s, 1 if text[s:e] in "([" else -1)
+                    for s, e, tt in tokens
+                    if tt == "brk" and text[s:e] in "()[]"]
+    paren_depths = depth_at_line_starts(li.starts, paren_events)
+
+    # Multi-line string/comment spans (skip line-level checks inside them).
+    ml_spans = []
+    by_line = {}
+    for s, e, tt in tokens:
+        ln = li.line_col(s)[0]
+        by_line.setdefault(ln, []).append((s, e, tt))
+        if tt in ("string", "comment", "codeblock") and "\n" in text[s:e]:
+            ml_spans.append((ln, li.line_col(e - 1)[0]))
+
+    def in_multiline(ln):
+        return any(a < ln <= b for a, b in ml_spans)
+
+    # ---- unterminated strings ------------------------------------------
+    for s, e, tt in tokens:
+        if tt != "string":
+            continue
+        tok = text[s:e]
+        m = re.search(r"['\"`]", tok[:4])
+        if not m:
+            continue
+        q = m.group(0)
+        qpos = m.start()
+        if tok[qpos:qpos + 3] == q * 3 and sp["triple"]:
+            if not (len(tok) >= qpos + 6 and tok.endswith(q * 3)):
+                ln, col = li.line_col(s)
+                add(ln, col, col + 3, "warn",
+                    "This triple-quoted string is never closed",
+                    ("append_eof", q * 3))
+            continue
+        if "\n" in tok:  # unterminated backtick template reaching EOF
+            if not (len(tok) >= qpos + 2 and tok.endswith(q)):
+                ln, col = li.line_col(s)
+                add(ln, col, col + 1, "warn",
+                    "This template string is never closed", ("append_eof", q))
+            continue
+        if not (len(tok) >= qpos + 2 and tok.endswith(q)):
+            ln, col = li.line_col(s)
+            add(ln, col, len(lines[ln - 1]), "error",
+                "Unclosed string - add a closing %s" % q, ("close_string", q))
+
+    # ---- unbalanced brackets (whole document) --------------------------
+    if lang_id not in NO_BRACKET_CHECK:
+        for off, ch in unclosed:
+            ln, col = li.line_col(off)
+            add(ln, col, col + 1, "warn",
+                "'%s' is never closed - add '%s'" % (ch, BRK_PAIR[ch]),
+                ("close_line", BRK_PAIR[ch]))
+        for off, ch in stray:
+            ln, col = li.line_col(off)
+            add(ln, col, col + 1, "error",
+                "Unexpected '%s' - nothing here needs closing" % ch)
+
+    # ---- per-line checks ------------------------------------------------
+    lc = sp["line_comment"]
+    for ln in sorted(by_line):
+        if in_multiline(ln) or len(issues) >= max_issues:
+            continue
+        ltoks = by_line[ln]
+        line_text = lines[ln - 1] if ln - 1 < len(lines) else ""
+        masked = _masked(text, li, ln, ltoks, line_text)
+
+        # Python: compound statement missing ':'
+        if lang_id == "python" and depths[ln - 1] == 0:
+            code_toks = [t for t in ltoks if t[2] != "comment"]
+            if code_toks:
+                w0 = text[code_toks[0][0]:code_toks[0][1]]
+                head = w0
+                if w0 == "async" and len(code_toks) > 1:
+                    head = text[code_toks[1][0]:code_toks[1][1]]
+                if (code_toks[0][2] == "keyword" and
+                        (w0 in COMPOUND_PY or
+                         (w0 == "async" and head in ("def", "for", "with")))):
+                    d = 0
+                    has_colon = False
+                    for s, e, tt in code_toks:
+                        chs = text[s:e]
+                        if tt == "brk":
+                            d += 1 if chs in BRK_PAIR else -1
+                        elif tt == "punct" and d == 0 and ":" in chs:
+                            has_colon = True
+                    lastc = text[code_toks[-1][0]:code_toks[-1][1]]
+                    if d == 0 and not has_colon and not lastc.endswith("\\"):
+                        c0 = li.line_col(code_toks[0][0])[1]
+                        c1 = li.line_col(code_toks[-1][1] - 1)[1] + 1
+                        add(ln, c0, c1, "error",
+                            "Missing ':' at the end of this '%s' statement"
+                            % head, ("colon", None))
+
+        # Python 2 style print. Match on the raw line (not the string-masked
+        # one) so that `print "hello"` - whose argument is blanked out in the
+        # masked copy - is still caught.
+        if lang_id == "python" and depths[ln - 1] == 0:
+            m = re.match(r"^[ \t]*print[ \t]+[^(=\s]", line_text)
+            if m:
+                col = len(line_text) - len(line_text.lstrip())
+                add(ln, col, col + 5, "warn",
+                    "In Python 3, print needs parentheses: print(...)",
+                    ("print_call", None))
+
+        # Python: tabs mixed with spaces in indentation
+        if lang_id == "python" and re.match(r"^(?: +\t|\t+ )", line_text):
+            add(ln, 0, len(line_text) - len(line_text.lstrip()), "warn",
+                "Indentation mixes tabs and spaces", ("untabify", None))
+
+        # '=' inside an if/while condition (C-family)
+        if heuristics and (sp["family"] == "clike" or
+                           lang_id in CLIKE_SEMI_LANGS):
+            m = re.search(r"\b(if|while)\b[ \t]*\(([^()]*)", masked)
+            if m:
+                m2 = re.search(r"(?<![=!<>+\-*/%&|^])=(?![=>])", m.group(2))
+                if m2:
+                    col = m.start(2) + m2.start()
+                    add(ln, col, col + 1, "warn",
+                        "'=' assigns a value - did you mean '=='?",
+                        ("eq_cond", None))
+
+        # Possible missing semicolon (conservative, info only).
+        # Gate on paren/bracket depth so statements inside a { } block are
+        # checked, but continuation lines inside ( ) or [ ] are not.
+        if (heuristics and lang_id in CLIKE_SEMI_LANGS
+                and paren_depths[ln - 1] == 0):
+            t = masked.rstrip()
+            st = t.lstrip()
+            net = 0
+            for s, e, tt in ltoks:
+                if tt == "brk":
+                    net += 1 if text[s:e] in BRK_PAIR else -1
+            if t and net == 0 and st and not st.startswith(("#", "@", "/", "}", "*")):
+                last = t[-1]
+                ok_end = (last.isalnum() or last in "_)]\"'" or
+                          t.endswith("++") or t.endswith("--"))
+                w = re.match(r"[A-Za-z_]*", st).group(0)
+                nxt = ""
+                for k in range(ln, min(ln + 3, len(lines))):
+                    if lines[k].strip():
+                        nxt = lines[k].strip()
+                        break
+                if (ok_end and w not in SEMI_SKIP_START and
+                        not (nxt and nxt[0] in "{.)+-*/=<>?&|,:;")):
+                    add(ln, len(t) - 1, len(t), "info",
+                        "This statement may be missing a ';'",
+                        ("semicolon", None))
+
+    # ---- whole-file syntax checks ---------------------------------------
+    if lang_id == "python" and len(text) < 300000:
+        try:
+            tree = ast.parse(text, filename or "<geskoide>")
+        except SyntaxError as ex:
+            ln = ex.lineno or 1
+            if ln not in error_lines:
+                col = max(0, (ex.offset or 1) - 1)
+                add(ln, col, col + 1, "error",
+                    "Python: %s" % (ex.msg or "invalid syntax"))
+        except Exception:
+            pass
+        else:
+            # Real semantic analysis: undefined names, unused imports.
+            try:
+                for l, c, sev, msg, fix in analyze_python(tree):
+                    if l not in error_lines:
+                        add(l, c, c + 1, sev, msg, fix)
+            except Exception:
+                pass
+
+    if lang_id == "json" and text.strip() and "//" not in text:
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as ex:
+            if ex.lineno not in error_lines:
+                add(ex.lineno, max(0, ex.colno - 1), ex.colno, "error",
+                    "JSON: %s" % ex.msg)
+        except Exception:
+            pass
+
+    if lang_id == "java" and filename:
+        stem = os.path.splitext(os.path.basename(filename))[0]
+        m = re.search(r"\bpublic\s+(?:final\s+|abstract\s+)*"
+                      r"(?:class|interface|enum|record)\s+(\w+)", text)
+        if m and re.match(r"^\w+$", stem) and m.group(1) != stem:
+            ln = text[:m.start(1)].count("\n") + 1
+            col = m.start(1) - (text.rfind("\n", 0, m.start(1)) + 1)
+            add(ln, col, col + len(m.group(1)), "warn",
+                "Public class '%s' should match the file name '%s'"
+                % (m.group(1), stem), ("rename_class", stem))
+
+    issues.sort(key=lambda i: (i.line, SEV_ORDER[i.severity], i.col))
+    return issues[:max_issues]
+
+
+# --------------------------------------------------------------------------
+# Python semantic analysis (offline, standard-library `ast`).
+# Conservative on purpose: only flags a name that is used but never bound
+# ANYWHERE in the module, so real typos surface without false alarms.
+# --------------------------------------------------------------------------
+
+_PY_BUILTINS = set(dir(_builtins)) | {
+    "__file__", "__name__", "__doc__", "__spec__", "__loader__",
+    "__package__", "__builtins__", "__debug__", "__dict__", "__class__",
+    "__module__", "__qualname__", "__annotations__", "self", "cls", "_"}
+
+_MatchAs = getattr(ast, "MatchAs", None)
+_MatchStar = getattr(ast, "MatchStar", None)
+_MatchMapping = getattr(ast, "MatchMapping", None)
+
+
+def analyze_python(tree):
+    """Return [(line, col, severity, message, fix), ...]."""
+    defined = set()
+    used = {}
+    imported = {}
+    star = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                nm = a.asname or a.name.split(".")[0]
+                defined.add(nm)
+                imported[nm] = (node.lineno, a.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            for a in node.names:
+                if a.name == "*":
+                    star = True
+                    continue
+                nm = a.asname or a.name
+                defined.add(nm)
+                imported[nm] = (node.lineno, a.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            defined.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            defined.update(node.names)
+        elif isinstance(node, ast.arg):
+            defined.add(node.arg)
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            else:
+                used.setdefault(node.id, (node.lineno, node.col_offset))
+        elif _MatchAs and isinstance(node, _MatchAs) and node.name:
+            defined.add(node.name)
+        elif _MatchStar and isinstance(node, _MatchStar) and node.name:
+            defined.add(node.name)
+        elif _MatchMapping and isinstance(node, _MatchMapping) and node.rest:
+            defined.add(node.rest)
+
+    out = []
+    has_all = "__all__" in defined
+    if not star:
+        for name, (l, c) in used.items():
+            if name not in defined and name not in _PY_BUILTINS:
+                out.append((l, c, "warn",
+                            "'%s' is not defined - a typo or a missing import?"
+                            % name, None))
+    used_ids = set(used)
+    if not star and not has_all:
+        for nm, (l, full) in imported.items():
+            if not nm.startswith("_") and nm not in used_ids:
+                out.append((l, 0, "info",
+                            "'%s' is imported but never used" % nm, None))
+    return out
+
+
+# --------------------------------------------------------------------------
+# External diagnostics: run the language's OWN compiler/checker (already on
+# this computer) to get real, precise errors - fully offline, no APIs.
+# --------------------------------------------------------------------------
+
+def _java_stem(text):
+    m = re.search(r"\bpublic\s+(?:final\s+|abstract\s+|sealed\s+)*"
+                  r"(?:class|interface|enum|record)\s+(\w+)", text)
+    return (m.group(1) if m else "Main") + ".java"
+
+
+# lang_id -> dict(tools, args(tool, path)->argv, parse, name(text)->filename)
+EXTERNAL_LINTERS = {
+    "c": dict(tools=("clang", "gcc", "cc"),
+              args=lambda t, p: [t, "-fsyntax-only", "-fno-caret-diagnostics",
+                                 "-Wall", p], parse="gcc"),
+    "cpp": dict(tools=("clang++", "g++", "c++"),
+                args=lambda t, p: [t, "-fsyntax-only",
+                                   "-fno-caret-diagnostics", "-std=c++17",
+                                   "-Wall", p], parse="gcc"),
+    "javascript": dict(tools=("node",),
+                       args=lambda t, p: [t, "--check", p], parse="node"),
+    "typescript": dict(tools=("tsc", "deno"),
+                       args=lambda t, p: ([t, "--noEmit", "--pretty", "false",
+                                           "--target", "es2020", "--module",
+                                           "esnext", p] if t.endswith("tsc")
+                                          else [t, "check", p]), parse="tsc"),
+    "shell": dict(tools=("bash",), args=lambda t, p: [t, "-n", p],
+                  parse="bash"),
+    "php": dict(tools=("php",), args=lambda t, p: [t, "-l", p], parse="php"),
+    "ruby": dict(tools=("ruby",), args=lambda t, p: [t, "-c", p],
+                 parse="ruby"),
+    "perl": dict(tools=("perl",), args=lambda t, p: [t, "-c", p],
+                 parse="perl"),
+    "lua": dict(tools=("luac", "luac5.4", "luac5.3"),
+                args=lambda t, p: [t, "-p", p], parse="gcc"),
+    "go": dict(tools=("gofmt",), args=lambda t, p: [t, "-e", p], parse="gcc"),
+    "java": dict(tools=("javac",),
+                 args=lambda t, p: [t, "-d", os.path.dirname(p),
+                                    "-Xlint:none", p], parse="gcc",
+                 name=_java_stem),
+}
+
+_tool_cache = {}
+
+
+def linter_tool(lang_id):
+    """Path of the checker for a language, or None. Cached per process."""
+    spec = EXTERNAL_LINTERS.get(lang_id)
+    if not spec:
+        return None
+    if lang_id not in _tool_cache:
+        _tool_cache[lang_id] = which_tool(*spec["tools"])
+    return _tool_cache[lang_id]
+
+
+_DIAG_FULL = re.compile(
+    r"^(?P<f>.*?):(?P<l>\d+):(?P<c>\d+):\s*"
+    r"(?P<s>fatal error|error|warning|note):\s*(?P<m>.*)$")
+_DIAG_LINE = re.compile(
+    r"^(?P<f>.*?):(?P<l>\d+):\s*(?P<s>error|warning):\s*(?P<m>.*)$")
+
+
+def _sev_of(word):
+    if "error" in word:
+        return "error"
+    if "warn" in word:
+        return "warn"
+    return "info"
+
+
+def _fix_for(msg):
+    m = msg.lower()
+    if ("expected ';'" in m or "';' expected" in m or "missing ';'" in m
+            or "expected ';' after" in m):
+        return ("semicolon", None)
+    return None
+
+
+def parse_diagnostics(kind, out):
+    """Parse a checker's output into [(line, col, sev, msg, fix), ...]."""
+    res = []
+    node_line = None
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        if kind == "gcc":
+            m = _DIAG_FULL.match(line)
+            if m and m.group("s") != "note":
+                res.append((int(m.group("l")), max(0, int(m.group("c")) - 1),
+                            _sev_of(m.group("s")), m.group("m").strip(),
+                            _fix_for(m.group("m"))))
+                continue
+            m = _DIAG_LINE.match(line)
+            if m:
+                res.append((int(m.group("l")), 0, _sev_of(m.group("s")),
+                            m.group("m").strip(), _fix_for(m.group("m"))))
+        elif kind == "node":
+            m = re.match(r"^.*?:(\d+)$", line.strip())
+            if m and node_line is None:
+                node_line = int(m.group(1))
+            m = re.match(r"^([A-Za-z]+Error): (.*)$", line.strip())
+            if m:
+                res.append((node_line or 1, 0, "error",
+                            "%s: %s" % (m.group(1), m.group(2)), None))
+        elif kind == "bash":
+            m = re.search(r"line (\d+): (.*)$", line)
+            if m:
+                res.append((int(m.group(1)), 0, "error",
+                            m.group(2).strip(), None))
+        elif kind == "php":
+            m = re.search(r"(?:Parse|Fatal|syntax) error:\s*(.*?) in .* "
+                          r"on line (\d+)", line)
+            if m:
+                res.append((int(m.group(2)), 0, "error",
+                            m.group(1).strip(), None))
+        elif kind == "ruby":
+            m = re.match(r"^(?:ruby: )?.+?:(\d+): (?:(warning): )?(.*)$", line)
+            if m:
+                msg = re.sub(r"\s*\((?:Syntax)?Error\)\s*$", "", m.group(3))
+                res.append((int(m.group(1)), 0,
+                            "warn" if m.group(2) else "error",
+                            msg.strip(), None))
+        elif kind == "perl":
+            if "syntax OK" in line:
+                continue
+            m = re.search(r"^(.*?) at .*? line (\d+)", line)
+            if m:
+                res.append((int(m.group(2)), 0, "error",
+                            m.group(1).strip(), None))
+        elif kind == "tsc":
+            m = re.match(r"^(.*?)[\(:](\d+),(\d+)[\):]:?\s*"
+                         r"(error|warning) TS\d+:\s*(.*)$", line)
+            if m:
+                res.append((int(m.group(2)), max(0, int(m.group(3)) - 1),
+                            _sev_of(m.group(4)), m.group(5).strip(), None))
+    return res
+
+
+def run_linter(lang_id, text):
+    """Run the external checker and return raw diagnostics (or [])."""
+    spec = EXTERNAL_LINTERS.get(lang_id)
+    tool = linter_tool(lang_id)
+    if not spec or not tool:
+        return []
+    d = tempfile.mkdtemp(prefix="geskolint-")
+    try:
+        name = spec.get("name", lambda _t: "buffer" + LANGS[lang_id]["exts"][0])
+        fname = name(text) if callable(name) else name
+        path = os.path.join(d, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        argv = spec["args"](tool, path)
+        env = dict(os.environ)
+        env["LC_ALL"] = env.get("LC_ALL", "C")
+        try:
+            proc = subprocess.run(argv, cwd=d, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  timeout=9, env=env, errors="replace")
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+        return parse_diagnostics(spec["parse"], proc.stdout or "")
+    except Exception as ex:
+        _log_error("run_linter", ex)
+        return []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def fixed_line_text(line, issue, sp):
+    """Return the repaired version of one line, or None if not applicable."""
+    kind, data = issue.fix
+    lc = sp["line_comment"]
+    code, comment = split_code_comment(line, lc)
+    tail = ("  " + comment) if comment else ""
+    if kind == "colon":
+        base = code.rstrip()
+        if not base or base.endswith(":"):
+            return None
+        return base + ":" + tail
+    if kind == "close_line":
+        return code.rstrip() + data + tail
+    if kind == "close_string":
+        return line + data
+    if kind == "semicolon":
+        base = code.rstrip()
+        if not base or base.endswith(";"):
+            return None
+        return base + ";" + tail
+    if kind == "print_call":
+        m = re.match(r"^([ \t]*)print[ \t]+(.+?)[ \t]*$", code)
+        if not m:
+            return None
+        return m.group(1) + "print(" + m.group(2) + ")" + tail
+    if kind == "untabify":
+        m = re.match(r"^[ \t]+", line)
+        if not m:
+            return None
+        ws = m.group(0).replace("\t", " " * sp["indent"])
+        return ws + line[m.end():]
+    if kind == "eq_cond":
+        c = issue.col
+        if c < len(line) and line[c] == "=":
+            return line[:c] + "==" + line[c + 1:]
+        return None
+    return None
+
+
+def outline_items(text, lang_id, limit=600):
+    """Build a compact table-of-contents for a source buffer."""
+    out = []
+    sp = LANGS.get(lang_id, LANGS["text"])
+    unit = max(1, sp.get("indent", 4))
+
+    def level_of(line):
+        raw = line[:len(line) - len(line.lstrip(" \t"))]
+        width = 0
+        for ch in raw:
+            width += unit if ch == "\t" else 1
+        return min(8, width // unit)
+
+    def add(line_no, level, kind, name):
+        name = re.sub(r"\s+", " ", name.strip())
+        if name and len(out) < limit:
+            out.append(OutlineItem(line_no, level, kind, name[:96]))
+
+    for line_no, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if (not stripped or stripped.startswith(("//", "/*", "*", "--"))
+                or (lang_id != "markdown" and stripped.startswith("#"))):
+            continue
+        level = level_of(line)
+        m = None
+
+        if lang_id == "python":
+            m = re.match(r"^\s*(async\s+def|def|class)\s+([A-Za-z_]\w*)", line)
+            if m:
+                add(line_no, level, m.group(1), m.group(2))
+                continue
+        elif lang_id == "markdown":
+            m = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
+            if m:
+                add(line_no, len(m.group(1)) - 1, "heading", m.group(2))
+                continue
+        elif lang_id in ("html",):
+            m = re.match(r"^\s*<\s*(h[1-6]|section|article|main|nav|div)\b([^>]*)>", line, re.I)
+            if m:
+                attrs = m.group(2)
+                label = m.group(1).lower()
+                ident = re.search(r"\b(?:id|class)\s*=\s*['\"]([^'\"]+)['\"]", attrs)
+                add(line_no, level, "tag", label + ((" #" + ident.group(1)) if ident else ""))
+                continue
+        elif lang_id in ("css",):
+            if stripped.endswith("{"):
+                add(line_no, level, "rule", stripped[:-1].strip())
+                continue
+        elif lang_id == "sql":
+            m = re.match(r"^\s*create\s+(table|view|index|trigger|function|procedure)\s+([A-Za-z_][\w.]*)", line, re.I)
+            if m:
+                add(line_no, level, m.group(1).lower(), m.group(2))
+                continue
+
+        m = re.match(r"^\s*(?:export\s+|public\s+|private\s+|protected\s+|internal\s+|open\s+|final\s+|abstract\s+|sealed\s+|data\s+|static\s+)*(class|interface|enum|struct|record|object|trait)\s+([A-Za-z_$][\w$]*)", line)
+        if m:
+            add(line_no, level, m.group(1), m.group(2))
+            continue
+        m = re.match(r"^\s*(?:export\s+|async\s+|suspend\s+|static\s+)*(func|fun|function|def|fn)\s+(?:\([^)]*\)\s*)?([A-Za-z_$][\w$]*)", line)
+        if m:
+            add(line_no, level, m.group(1), m.group(2))
+            continue
+        if lang_id in ("c", "cpp", "java", "csharp", "go", "rust", "swift", "kotlin"):
+            m = re.match(r"^\s*(?:[A-Za-z_$][\w$<>\[\],.?*&:\s]+\s+)+([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?:\{|=>)?\s*$", line)
+            if m and m.group(1) not in ("if", "for", "while", "switch", "catch"):
+                add(line_no, level, "method", m.group(1))
+
+    return out
+
+
+# --------------------------------------------------------------------------
+# Completion engine (document words + language vocabulary, ranked).
+# --------------------------------------------------------------------------
+
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def collect_completions(text, prefix, lang_id, limit=12):
+    if not prefix:
+        return []
+    sp = LANGS[lang_id]
+    words = Counter(WORD_RE.findall(text))
+    if prefix in words:
+        words[prefix] -= 1
+    cands = {}
+    for w, cnt in words.items():
+        if len(w) >= 2 and cnt > 0:
+            cands[w] = cnt
+    for pool, bonus in ((sp["keywords"], 3), (sp["builtins"], 2),
+                        (sp["types"], 2), (sp["constants"], 2)):
+        for w in pool:
+            cands[w] = cands.get(w, 0) + bonus
+    lp = prefix.lower()
+    exact, loose = [], []
+    for w, cnt in cands.items():
+        if w == prefix:
+            continue
+        if w.startswith(prefix):
+            exact.append((-cnt, len(w), w))
+        elif w.lower().startswith(lp):
+            loose.append((-cnt, len(w), w))
+    exact.sort()
+    loose.sort()
+    return [w for _, _, w in exact + loose][:limit]
+
+
+def current_word(line_to_cursor):
+    m = re.search(r"[A-Za-z_][A-Za-z0-9_]*$", line_to_cursor)
+    return m.group(0) if m else ""
+
+
+# Standard-library modules that are safe to import for introspection-based
+# member completion (import has no side effects). All offline.
+_SAFE_STDLIB = {
+    "os", "sys", "re", "math", "cmath", "random", "json", "time", "datetime",
+    "collections", "itertools", "functools", "operator", "string", "textwrap",
+    "statistics", "decimal", "fractions", "pathlib", "glob", "shutil",
+    "tempfile", "io", "csv", "sqlite3", "hashlib", "hmac", "secrets", "base64",
+    "struct", "array", "bisect", "heapq", "copy", "pprint", "enum", "types",
+    "typing", "dataclasses", "abc", "numbers", "unicodedata", "difflib",
+    "urllib", "http", "socket", "threading", "multiprocessing", "queue",
+    "subprocess", "signal", "select", "asyncio", "logging", "argparse",
+    "configparser", "platform", "getpass", "uuid", "zlib", "gzip", "bz2",
+    "lzma", "zipfile", "tarfile", "pickle", "shelve", "calendar", "locale",
+    "gettext", "warnings", "traceback", "inspect", "importlib", "contextlib",
+    "weakref", "gc", "ast", "dis", "tokenize", "keyword", "builtins",
+    "turtle", "tkinter", "html", "xml", "email", "unittest", "doctest",
+    "timeit", "cProfile", "profile", "webbrowser", "ctypes", "fnmatch",
+}
+_member_cache = {}
+
+
+def python_member_completions(text, obj, prefix, limit=40):
+    """Complete `obj.<prefix>` when obj is an imported stdlib module.
+    Uses dir() introspection - entirely offline, no code execution."""
+    real = None
+    for m in re.finditer(r"^[ \t]*import[ \t]+(.+)$", text, re.M):
+        for part in m.group(1).split(","):
+            p = part.strip().split("#")[0].strip()
+            mm = re.match(r"([\w.]+)(?:[ \t]+as[ \t]+(\w+))?$", p)
+            if not mm:
+                continue
+            alias = mm.group(2) or mm.group(1).split(".")[0]
+            if alias == obj:
+                real = mm.group(1) if mm.group(2) else mm.group(1).split(".")[0]
+    if real is None and obj in _SAFE_STDLIB:
+        real = obj
+    if real is None or real.split(".")[0] not in _SAFE_STDLIB:
+        return None
+    if real not in _member_cache:
+        try:
+            import importlib
+            mod = importlib.import_module(real)
+            names = [n for n in dir(mod) if not n.startswith("__")]
+            _member_cache[real] = sorted(names)
+        except Exception:
+            _member_cache[real] = []
+    members = _member_cache[real]
+    lp = prefix.lower()
+    hits = [n for n in members if n.startswith(prefix)]
+    if not hits:
+        hits = [n for n in members if n.lower().startswith(lp)]
+    pub = [n for n in hits if not n.startswith("_")]
+    return (pub + [n for n in hits if n.startswith("_")])[:limit] or None
+
+
+def compute_completions(text, line_before_cursor, lang_id):
+    """Return candidate FULL replacements for the token before the caret.
+    Smart for Python (member introspection); word-based elsewhere."""
+    prefix = current_word(line_before_cursor)
+    # Python member completion: `module.<prefix>`
+    if lang_id == "python":
+        m = re.search(r"([A-Za-z_][\w]*)\.\s*$"
+                      if not prefix else
+                      r"([A-Za-z_][\w]*)\.%s$" % re.escape(prefix),
+                      line_before_cursor)
+        if m:
+            got = python_member_completions(text, m.group(1), prefix)
+            if got:
+                return got
+    return collect_completions(text, prefix, lang_id)
+
+
+# --------------------------------------------------------------------------
+# Running & debugging - entirely with tools already on this computer.
+# --------------------------------------------------------------------------
+
+def which_tool(*names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def _tool_missing(name, hint):
+    return ("info",
+            "%s is not installed on this computer. %s\n"
+            "GeskoIDE runs code with local tools only (no internet needed "
+            "while coding)." % (name, hint))
+
+
+def _native_debugger():
+    """Path to lldb or gdb if present (both ship with common dev toolchains)."""
+    return which_tool("lldb", "gdb")
+
+
+def _dbg_step(dbg, binout):
+    """A step that drops into lldb/gdb at the program's start, interactively."""
+    if dbg.endswith("lldb"):
+        return {"argv": [dbg, binout],
+                "label": "lldb - type:  b main | run | n | s | p <var> | c | q"}
+    return {"argv": [dbg, binout],
+            "label": "gdb - type:  break main | run | next | step | print <v> "
+                     "| continue | quit"}
+
+
+def build_steps(lang_id, path, debug=False):
+    """Return ("steps", [ {argv, label?, stdin_file?} ]) or ("info", msg)
+    or ("open", path). Everything runs 100% locally."""
+    r = LANGS[lang_id]["run"] or lang_id
+    stem = os.path.splitext(os.path.basename(path))[0]
+    tmpdir = tempfile.mkdtemp(prefix="geskoide-run-")
+    binout = os.path.join(tmpdir, stem + (".exe" if IS_WIN else ".bin"))
+
+    if r == "python":
+        py = sys.executable or which_tool("python3", "python")
+        if debug:
+            return "steps", [{"argv": [py, "-u", "-m", "pdb", path],
+                              "label": "pdb debugger - n:next  s:step  c:continue  "
+                                       "p expr:print  b line:breakpoint  q:quit"}]
+        return "steps", [{"argv": [py, "-u", path]}]
+
+    if r == "node":
+        node = which_tool("node")
+        if not node:
+            return _tool_missing("Node.js", "Install it once from nodejs.org "
+                                            "(or: brew install node).")
+        if debug:
+            return "steps", [{"argv": [node, "inspect", path],
+                              "label": "node inspect - type:  cont | next | "
+                                       "step | out | repl | exec <expr> | .exit"}]
+        return "steps", [{"argv": [node, path]}]
+
+    if r == "typescript":
+        deno = which_tool("deno")
+        if deno:
+            return "steps", [{"argv": [deno, "run", "--allow-all", path]}]
+        bun = which_tool("bun")
+        if bun:
+            return "steps", [{"argv": [bun, "run", path]}]
+        tsn = which_tool("ts-node")
+        if tsn:
+            return "steps", [{"argv": [tsn, path]}]
+        return _tool_missing("A TypeScript runtime (Deno, Bun or ts-node)",
+                             "Plain JavaScript runs with Node out of the box.")
+
+    if r == "shell":
+        sh = which_tool("bash", "zsh", "sh")
+        if not sh:
+            return _tool_missing("A POSIX shell", "")
+        argv = [sh, "-x", path] if debug else [sh, path]
+        lbl = "bash -x trace" if debug else None
+        step = {"argv": argv}
+        if lbl:
+            step["label"] = lbl
+        return "steps", [step]
+
+    if r in ("ruby", "perl", "php", "lua"):
+        t = which_tool(r)
+        if not t:
+            return _tool_missing(LANGS[lang_id]["name"],
+                                 "macOS ships Ruby and Perl; PHP/Lua: brew install %s." % r)
+        if debug and r == "perl":
+            return "steps", [{"argv": [t, "-d", path],
+                              "label": "perl debugger - type:  n | s | c | "
+                                       "p $var | b <line> | q"}]
+        if debug and r == "ruby":
+            rdbg = which_tool("rdbg")
+            if rdbg:
+                return "steps", [{"argv": [rdbg, path],
+                                  "label": "rdbg - type:  step | next | "
+                                           "continue | p <expr> | break <line>"}]
+        return "steps", [{"argv": [t, path]}]
+
+    if r == "applescript":
+        osa = which_tool("osascript")
+        if not osa:
+            return "info", "AppleScript needs macOS (osascript was not found)."
+        return "steps", [{"argv": [osa, path]}]
+
+    if r == "swift":
+        sw = which_tool("swift")
+        if not sw:
+            return _tool_missing("Swift", "Run once:  xcode-select --install")
+        return "steps", [{"argv": [sw, path]}]
+
+    if r == "c":
+        cc = which_tool("cc", "clang", "gcc")
+        if not cc:
+            return _tool_missing("A C compiler", "Run once:  xcode-select --install")
+        base = [cc, "-std=c11", "-Wall"]
+        tail = (["-lm"] if not IS_WIN else [])
+        dbg = _native_debugger()
+        if debug and dbg:
+            return "steps", [{"argv": base + ["-g", "-O0", path, "-o", binout]
+                              + tail, "label": "compile (with debug info)"},
+                             _dbg_step(dbg, binout)]
+        return "steps", [{"argv": base + [path, "-o", binout] + tail,
+                          "label": "compile"},
+                         {"argv": [binout], "label": "run"}]
+
+    if r == "cpp":
+        cxx = which_tool("c++", "clang++", "g++")
+        if not cxx:
+            return _tool_missing("A C++ compiler", "Run once:  xcode-select --install")
+        base = [cxx, "-std=c++17", "-Wall"]
+        dbg = _native_debugger()
+        if debug and dbg:
+            return "steps", [{"argv": base + ["-g", "-O0", path, "-o", binout],
+                              "label": "compile (with debug info)"},
+                             _dbg_step(dbg, binout)]
+        return "steps", [{"argv": base + [path, "-o", binout],
+                          "label": "compile"},
+                         {"argv": [binout], "label": "run"}]
+
+    if r == "go":
+        g = which_tool("go")
+        if not g:
+            return _tool_missing(
+                "Go", "Install once from go.dev (or: brew install go). "
+                "The Android APK bundles its own Go runner; this Mac .command "
+                "file stays a single Python app and uses the tools installed "
+                "on this computer.")
+        if debug:
+            dlv = which_tool("dlv")
+            if dlv:
+                return "steps", [{"argv": [dlv, "debug", path],
+                                  "label": "delve - type:  break main.main | "
+                                           "continue | next | step | print <v> "
+                                           "| quit"}]
+            return "steps", [{"argv": [g, "run", path],
+                              "label": "run (install 'dlv' for step debugging: "
+                                       "go install github.com/go-delve/delve/"
+                                       "cmd/dlv@latest)"}]
+        return "steps", [{"argv": [g, "run", path]}]
+
+    if r == "rust":
+        rc_ = which_tool("rustc")
+        if not rc_:
+            return _tool_missing("Rust", "Install once from rustup.rs.")
+        dbg = which_tool("rust-lldb", "rust-gdb") or _native_debugger()
+        if debug and dbg:
+            return "steps", [{"argv": [rc_, "-g", path, "-o", binout],
+                              "label": "compile (with debug info)"},
+                             _dbg_step(dbg, binout)]
+        return "steps", [{"argv": [rc_, path, "-o", binout], "label": "compile"},
+                         {"argv": [binout], "label": "run"}]
+
+    if r == "java":
+        j = which_tool("java")
+        if not j:
+            return _tool_missing("Java (JDK 11+)", "Install once: brew install openjdk.")
+        if debug and which_tool("jdb"):
+            return "steps", [{"argv": [which_tool("jdb"), path],
+                              "label": "jdb - type:  stop at Main:<line> | run "
+                                       "| next | step | print <v> | cont"}]
+        return "steps", [{"argv": [j, path]}]
+
+    if r == "kotlin":
+        k = which_tool("kotlinc")
+        if not k:
+            return _tool_missing("Kotlin", "Install once: brew install kotlin.")
+        jar = os.path.join(tmpdir, stem + ".jar")
+        return "steps", [{"argv": [k, path, "-include-runtime", "-d", jar],
+                          "label": "compile"},
+                         {"argv": [which_tool("java") or "java", "-jar", jar],
+                          "label": "run"}]
+
+    if r == "csharp":
+        d = which_tool("dotnet")
+        if not d:
+            return _tool_missing("The .NET SDK", "Install once: brew install dotnet-sdk.")
+        return "info", ("C# needs a project to run: in Terminal, "
+                        "`dotnet new console` once, then GeskoIDE can edit the "
+                        "files and you run with `dotnet run`.")
+
+    if r == "sql":
+        sq = which_tool("sqlite3")
+        if not sq:
+            return _tool_missing("sqlite3", "macOS ships it by default.")
+        return "steps", [{"argv": [sq, "-batch", ":memory:"], "stdin_file": path,
+                          "label": "sqlite3 in-memory database"}]
+
+    if r == "html":
+        return "open", path
+
+    if r in ("css", "yaml", "text"):
+        return "info", ("A %s file has nothing to execute. Use Run on a "
+                        "program file, or open an HTML page for preview."
+                        % LANGS[lang_id]["name"])
+
+    return "info", "GeskoIDE does not know how to run %s yet." % LANGS[lang_id]["name"]
+
+
+def markdown_to_html(md, title="Preview"):
+    """Deliberately small offline Markdown-to-HTML converter for previews."""
+    def esc(s):
+        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    out = []
+    in_code = False
+    in_list = False
+    for line in md.split("\n"):
+        if line.strip().startswith("```"):
+            out.append("</pre>" if in_code else "<pre>")
+            in_code = not in_code
+            continue
+        if in_code:
+            out.append(esc(line))
+            continue
+        t = esc(line)
+        t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+        t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", t)
+        t = re.sub(r"\[([^\]]*)\]\(([^)]*)\)", r'<a href="\2">\1</a>', t)
+        m = re.match(r"^(#{1,6})\s*(.*)$", t)
+        if m:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            n = len(m.group(1))
+            out.append("<h%d>%s</h%d>" % (n, m.group(2), n))
+            continue
+        m = re.match(r"^\s*[-*+]\s+(.*)$", t)
+        if m:
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append("<li>%s</li>" % m.group(1))
+            continue
+        if in_list and not line.strip():
+            out.append("</ul>")
+            in_list = False
+            continue
+        out.append(t + "<br>" if line.strip() else "")
+    if in_list:
+        out.append("</ul>")
+    if in_code:
+        out.append("</pre>")
+    return ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>%s</title>"
+            "<style>body{font-family:-apple-system,'Helvetica Neue',sans-serif;"
+            "max-width:46em;margin:2em auto;padding:0 1em;line-height:1.55;"
+            "color:#1c2622}pre,code{background:#eef4f0;border-radius:5px;"
+            "padding:2px 5px}pre{padding:12px;overflow:auto}"
+            "a{color:#1d8a5b}</style></head><body>%s</body></html>"
+            % (esc(title), "\n".join(out)))
+
+
+class StepRunner:
+    """Runs subprocess steps in sequence; streams events through a queue.
+    Events: ("cmd"|"out"|"err"|"info", text) and finally ("done", rc, secs)."""
+
+    def __init__(self, steps, cwd=None):
+        self.steps = steps
+        self.cwd = cwd
+        self.events = _queue.Queue()
+        self.proc = None
+        self._stop = False
+        self.thread = threading.Thread(target=self._work, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def alive(self):
+        return self.thread.is_alive()
+
+    def send_line(self, line):
+        p = self.proc
+        try:
+            if p and p.poll() is None and p.stdin:
+                p.stdin.write(line + "\n")
+                p.stdin.flush()
+        except OSError:
+            pass
+
+    def stop(self):
+        self._stop = True
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+            def _kill():
+                time.sleep(1.2)
+                if p.poll() is None:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+            threading.Thread(target=_kill, daemon=True).start()
+
+    def _reader(self, stream, tag):
+        try:
+            for line in iter(stream.readline, ""):
+                self.events.put((tag, line))
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _work(self):
+        t0 = time.time()
+        rc = 0
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        for step in self.steps:
+            if self._stop:
+                break
+            argv = step["argv"]
+            if step.get("label"):
+                self.events.put(("info", "[%s]\n" % step["label"]))
+            self.events.put(("cmd", "$ %s\n" % " ".join(argv)))
+            fin = subprocess.PIPE
+            stdin_file = step.get("stdin_file")
+            try:
+                if stdin_file:
+                    fin = open(stdin_file, "r", encoding="utf-8")
+                self.proc = subprocess.Popen(
+                    argv, cwd=self.cwd, env=env, stdin=fin,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, bufsize=1, encoding="utf-8", errors="replace")
+            except OSError as ex:
+                self.events.put(("err", "Could not start %s: %s\n" % (argv[0], ex)))
+                rc = 127
+                break
+            readers = [
+                threading.Thread(target=self._reader,
+                                 args=(self.proc.stdout, "out"), daemon=True),
+                threading.Thread(target=self._reader,
+                                 args=(self.proc.stderr, "err"), daemon=True)]
+            for rd in readers:
+                rd.start()
+            rc = self.proc.wait()
+            for rd in readers:
+                rd.join(timeout=2)
+            if stdin_file and fin is not subprocess.PIPE:
+                try:
+                    fin.close()
+                except Exception:
+                    pass
+            if rc != 0:
+                break
+        self.events.put(("done", rc, time.time() - t0))
+
+
+# --------------------------------------------------------------------------
+# GUI (tkinter). Guarded so --selftest works even without a display / Tk.
+# --------------------------------------------------------------------------
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    from tkinter import font as tkfont
+    TK_OK = True
+except Exception:                                       # pragma: no cover
+    tk = None
+    TK_OK = False
+
+ALL_TOKEN_TAGS = list(TOKEN_COLORS.keys())
+ISSUE_TAGS = ("iss_error", "iss_warn", "iss_info")
+SEV_COLOR_KEY = {"error": "error", "warn": "warn", "info": "info"}
+
+if TK_OK:
+
+    def pick_family(root, prefs, fallback):
+        try:
+            fams = set(tkfont.families(root))
+        except Exception:
+            return fallback
+        for f in prefs:
+            if f in fams:
+                return f
+        return fallback
+
+    class FlatButton(tk.Label):
+        """A theme-friendly button (tk.Button ignores colors on macOS Aqua)."""
+
+        def __init__(self, master, text, command=None, kind="ghost",
+                     padx=12, pady=5, font=None):
+            self.command = command
+            if kind == "primary":
+                cfg = ("#2a9463", "#eafff2", "#3fd68f", "#07130d")
+            elif kind == "danger":
+                cfg = ("#54222c", "#ffd7d7", "#7c3140", "#ffe3e3")
+            else:
+                cfg = (THEME["bg_panel"], THEME["fg"],
+                       THEME["bg_hover"], THEME["fg"])
+            self.c_bg, self.c_fg, self.c_hbg, self.c_hfg = cfg
+            super().__init__(master, text=text, bg=self.c_bg, fg=self.c_fg,
+                             padx=padx, pady=pady, cursor="hand2",
+                             font=font)
+            self.bind("<Enter>", lambda e: self.configure(bg=self.c_hbg,
+                                                          fg=self.c_hfg))
+            self.bind("<Leave>", lambda e: self.configure(bg=self.c_bg,
+                                                          fg=self.c_fg))
+            self.bind("<Button-1>", self._click)
+
+        def _click(self, ev=None):
+            if self.command:
+                self.command()
+
+    class Popup(tk.Toplevel):
+        def __init__(self, master):
+            super().__init__(master)
+            self.overrideredirect(True)
+            try:
+                self.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self.configure(bg=THEME["border"])
+
+    class CompletionPopup(Popup):
+        def __init__(self, master, app, words, on_accept):
+            super().__init__(master)
+            self.on_accept = on_accept
+            self.lb = tk.Listbox(self, bg=THEME["bg_panel"], fg=THEME["fg"],
+                                 selectbackground=THEME["accent_dark"],
+                                 selectforeground="#eafff2",
+                                 highlightthickness=0, bd=0,
+                                 activestyle="none", font=app.mono_font,
+                                 width=0, height=min(8, len(words)))
+            self.lb.pack(padx=1, pady=1)
+            self.fill(words)
+            self.lb.bind("<Double-Button-1>", lambda e: self.accept())
+
+        def fill(self, words):
+            self.lb.delete(0, "end")
+            for w in words:
+                self.lb.insert("end", " %s " % w)
+            self.lb.configure(height=min(8, max(1, len(words))))
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(0)
+            self.lb.activate(0)
+
+        def move(self, d):
+            cur = self.lb.curselection()
+            i = max(0, min(self.lb.size() - 1, (cur[0] if cur else 0) + d))
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(i)
+            self.lb.activate(i)
+            self.lb.see(i)
+
+        def accept(self):
+            cur = self.lb.curselection()
+            if cur:
+                self.on_accept(self.lb.get(cur[0]).strip())
+
+    class HintPopup(Popup):
+        """The automatic hint bubble that appears while you type."""
+
+        def __init__(self, master, app, issue, on_fix):
+            super().__init__(master)
+            row = tk.Frame(self, bg=THEME["bg_panel"])
+            row.pack(padx=1, pady=1)
+            tk.Label(row, text="●", fg=THEME[SEV_COLOR_KEY[issue.severity]],
+                     bg=THEME["bg_panel"], font=app.small_font)\
+                .pack(side="left", padx=(9, 4), pady=4)
+            msg = issue.msg + ("   -  press Tab to fix" if issue.fix else "")
+            tk.Label(row, text=msg, fg=THEME["fg"], bg=THEME["bg_panel"],
+                     font=app.small_font).pack(side="left", pady=4)
+            if issue.fix and on_fix:
+                FlatButton(row, "Fix", command=on_fix, kind="primary",
+                           padx=9, pady=1, font=app.small_font)\
+                    .pack(side="left", padx=9, pady=3)
+            else:
+                tk.Label(row, text="  ", bg=THEME["bg_panel"]).pack(side="left")
+
+    class LineNumbers(tk.Canvas):
+        def __init__(self, master, editor):
+            super().__init__(master, width=52, bg=THEME["bg_gutter"],
+                             highlightthickness=0, bd=0)
+            self.editor = editor
+            self._job = None
+            self.bind("<Button-1>", self._click)
+
+        def schedule(self):
+            if self._job is None:
+                self._job = self.after(15, self.redraw)
+
+        def redraw(self):
+            self._job = None
+            ed = self.editor
+            t = ed.text
+            self.delete("all")
+            try:
+                cur = int(t.index("insert").split(".")[0])
+            except tk.TclError:
+                return
+            fnt = ed.app.mono_font
+            w = self.winfo_width()
+            i = t.index("@0,0")
+            for _ in range(400):
+                d = t.dlineinfo(i)
+                if d is None:
+                    break
+                ln = int(i.split(".")[0])
+                y = d[1]
+                color = THEME["accent"] if ln == cur else THEME["fg_faint"]
+                self.create_text(w - 8, y + 1, anchor="ne", text=str(ln),
+                                 fill=color, font=fnt)
+                sev = ed.issue_lines.get(ln)
+                if sev:
+                    self.create_oval(5, y + 5, 11, y + 11, outline="",
+                                     fill=THEME[SEV_COLOR_KEY[sev]])
+                nxt = t.index("%d.0+1line" % ln)
+                if nxt == i:
+                    break
+                i = nxt
+            digits = len(t.index("end-1c").split(".")[0])
+            want = 20 + fnt.measure("0") * max(2, digits)
+            if abs(want - w) > 3:
+                self.configure(width=want)
+
+        def _click(self, ev):
+            i = self.editor.text.index("@0,%d" % ev.y)
+            self.editor.text.mark_set("insert", "%s linestart" % i)
+            self.editor.text.focus_set()
+            self.editor.update_current_line()
+            self.schedule()
+
+    class EditorTab(tk.Frame):
+        """One open file: gutter + text + highlighting + auto-check."""
+
+        _counter = [0]
+        _mark_seq = [0]
+
+        def __init__(self, master, app, path=None, lang=None, content="",
+                     placeholders=()):
+            super().__init__(master, bg=THEME["bg_editor"])
+            self.app = app
+            self.path = path
+            first = content.split("\n", 1)[0] if content else ""
+            self.lang = lang or detect_language(path, first)
+            if path:
+                self.title = os.path.basename(path)
+            else:
+                EditorTab._counter[0] += 1
+                exts = LANGS[self.lang]["exts"]
+                self.title = "Untitled-%d%s" % (EditorTab._counter[0],
+                                                exts[0] if exts else ".txt")
+            self.dirty = False
+            self.issues = []
+            self.issue_lines = {}
+            self.check_error = None
+            self.placeholder_marks = []
+            self._jobs = {}
+            self._suppress = False
+            self._version = 0            # bumps on every edit (lint staleness)
+            self._comp = None            # inline completion cycle state
+            self._lint_q = _queue.Queue()
+            self._lint_running = False
+            self._lint_pending = False
+            self._lint_show_hint = False
+
+            self.gutter = LineNumbers(self, self)
+            self.gutter.pack(side="left", fill="y")
+            body = tk.Frame(self, bg=THEME["bg_editor"])
+            body.pack(side="left", fill="both", expand=True)
+            body.rowconfigure(0, weight=1)
+            body.columnconfigure(0, weight=1)
+
+            self.text = tk.Text(
+                body, wrap="none", undo=True, autoseparators=True, maxundo=-1,
+                bd=0, highlightthickness=0, bg=THEME["bg_editor"],
+                fg=TOKEN_COLORS["ident"], insertbackground=THEME["caret"],
+                insertwidth=2, selectbackground=THEME["sel"],
+                selectforeground=THEME["fg"], padx=10, pady=8,
+                font=app.mono_font, spacing1=1, spacing3=1)
+            self.vsb = tk.Scrollbar(body, orient="vertical",
+                                    command=self.text.yview, width=16)
+            hsb = tk.Scrollbar(body, orient="horizontal", command=self.text.xview)
+            self._vscroll_visible = True
+            self._vscroll_dragging = False
+            self.text.grid(row=0, column=0, sticky="nsew")
+            self.vsb.grid(row=0, column=1, sticky="ns")
+            hsb.grid(row=1, column=0, sticky="ew")
+
+            def _yset(a, b):
+                self.vsb.set(a, b)
+                self.gutter.schedule()
+                if len(self.get_text()) > 200000:
+                    self._schedule("hl_view", 200, self.highlight_viewport)
+            self.text.configure(yscrollcommand=_yset, xscrollcommand=hsb.set)
+            self._hide_vscroll()
+            self.apply_font()
+
+            self._config_tags()
+            if content:
+                self.text.insert("1.0", content)
+            for s, e in placeholders:
+                self._add_placeholder("1.0+%dc" % s, "1.0+%dc" % e)
+            self.text.edit_reset()
+            self.text.edit_modified(False)
+            self._bind()
+            self.highlight_all()
+            self.run_checks(show_hint=False)
+            self.update_current_line()
+            if self.placeholder_marks:
+                self.after(60, self.jump_placeholder)
+
+        # ---- setup -------------------------------------------------------
+
+        def _config_tags(self):
+            t = self.text
+            t.tag_configure("current_line", background=THEME["current_line"])
+            for name, color in TOKEN_COLORS.items():
+                kw = {"foreground": color}
+                if name in TOKEN_BOLD:
+                    kw["font"] = self.app.mono_bold
+                elif name in TOKEN_ITALIC:
+                    kw["font"] = self.app.mono_italic
+                t.tag_configure(name, **kw)
+            t.tag_configure("iss_error", underline=True, background="#331a1e")
+            t.tag_configure("iss_warn", underline=True, background="#33290f")
+            t.tag_configure("iss_info", underline=True)
+            t.tag_configure("find_match", background=THEME["find_match"])
+            t.tag_configure("brk_match", background=THEME["brk_match"])
+            t.tag_raise("sel")
+
+        def _bind(self):
+            t = self.text
+            t.bind("<<Modified>>", self._on_modified)
+            t.bind("<KeyRelease>", self._on_key_release)
+            t.bind("<ButtonRelease-1>", self._on_click)
+            t.bind("<KeyPress-Tab>", self._key_tab)
+            for seq in ("<Shift-Tab>", "<ISO_Left_Tab>", "<Shift-ISO_Left_Tab>"):
+                try:
+                    t.bind(seq, self._key_shift_tab)
+                except tk.TclError:
+                    pass
+            t.bind("<KeyPress-Return>", self._key_return)
+            t.bind("<KeyPress-KP_Enter>", self._key_return)
+            t.bind("<KeyPress-BackSpace>", self._key_backspace)
+            t.bind("<KeyPress-Escape>", self._key_escape)
+            t.bind("<KeyPress-Up>", lambda e: self._key_updown(-1))
+            t.bind("<KeyPress-Down>", lambda e: self._key_updown(1))
+            t.bind("<KeyPress-parenleft>", lambda e: self._key_open(e, "(", ")"))
+            t.bind("<KeyPress-bracketleft>", lambda e: self._key_open(e, "[", "]"))
+            t.bind("<KeyPress-braceleft>", lambda e: self._key_open(e, "{", "}"))
+            t.bind("<KeyPress-parenright>", lambda e: self._key_close(e, ")"))
+            t.bind("<KeyPress-bracketright>", lambda e: self._key_close(e, "]"))
+            t.bind("<KeyPress-braceright>", lambda e: self._key_close(e, "}"))
+            t.bind("<KeyPress-quotedbl>", lambda e: self._key_quote(e, '"'))
+            t.bind("<KeyPress-apostrophe>", lambda e: self._key_quote(e, "'"))
+            t.bind("<KeyPress-grave>", lambda e: self._key_quote(e, "`"))
+            t.bind("<Motion>", self._edge_scroll_motion)
+            t.bind("<Leave>", lambda e: self._hide_vscroll_later())
+            self.vsb.bind("<Enter>", lambda e: self._show_vscroll())
+            self.vsb.bind("<Leave>", lambda e: self._hide_vscroll_later())
+            self.vsb.bind("<ButtonPress-1>", self._vscroll_press)
+            self.vsb.bind("<ButtonRelease-1>", self._vscroll_release)
+
+        def apply_font(self):
+            sp = LANGS[self.lang]
+            px = max(8, self.app.mono_font.measure("0") * sp["indent"])
+            self.text.configure(font=self.app.mono_font, tabs=(px,))
+
+        def _show_vscroll(self):
+            if not self._vscroll_visible:
+                self.vsb.grid(row=0, column=1, sticky="ns")
+                self._vscroll_visible = True
+
+        def _hide_vscroll(self):
+            if self._vscroll_visible and not self._vscroll_dragging:
+                self.vsb.grid_remove()
+                self._vscroll_visible = False
+
+        def _hide_vscroll_later(self):
+            self._schedule("hide_vscroll", 650, self._hide_vscroll)
+
+        def _edge_scroll_motion(self, ev):
+            if ev.x >= max(0, self.text.winfo_width() - 28):
+                self._show_vscroll()
+            elif self._vscroll_visible and not self._vscroll_dragging:
+                self._hide_vscroll_later()
+
+        def _vscroll_press(self, ev):
+            self._vscroll_dragging = True
+            self._show_vscroll()
+
+        def _vscroll_release(self, ev):
+            self._vscroll_dragging = False
+            self._hide_vscroll_later()
+
+        # ---- small helpers -------------------------------------------------
+
+        def get_text(self):
+            return self.text.get("1.0", "end-1c")
+
+        def _schedule(self, key, ms, fn):
+            old = self._jobs.pop(key, None)
+            if old is not None:
+                try:
+                    self.after_cancel(old)
+                except Exception:
+                    pass
+
+            def run():
+                self._jobs.pop(key, None)
+                fn()
+            self._jobs[key] = self.after(ms, run)
+
+        def cur_line(self):
+            return int(self.text.index("insert").split(".")[0])
+
+        def update_current_line(self):
+            t = self.text
+            t.tag_remove("current_line", "1.0", "end")
+            t.tag_add("current_line", "insert linestart", "insert lineend+1c")
+
+        # ---- events --------------------------------------------------------
+
+        # Keys that never change the text; they must not mark the file dirty
+        # or trigger a re-check on their own.
+        _NON_EDIT_KEYS = frozenset((
+            "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+            "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+            "Meta_L", "Meta_R", "Super_L", "Super_R", "Command_L", "Command_R",
+            "Caps_Lock", "Num_Lock", "Escape", "Menu", "Help",
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
+            "F11", "F12"))
+
+        def _mark_dirty(self):
+            if not self.dirty:
+                self.dirty = True
+                self.app.refresh_titles()
+
+        def _schedule_updates(self):
+            self._version += 1
+            self._schedule("hl_line", 50, self.highlight_line_now)
+            self._schedule("hl_full", 400, self.highlight_all)
+            self._schedule("check", 550, self.run_checks)
+            if getattr(self.app, "outline", None) and self.app.outline.visible:
+                self._schedule("outline", 750, self.app.refresh_outline_if_visible)
+
+        def _on_modified(self, ev=None):
+            if self._suppress:
+                return
+            self._suppress = True
+            try:
+                self.text.edit_modified(False)
+            finally:
+                self._suppress = False
+            self._mark_dirty()
+            self._schedule_updates()
+
+        def _on_key_release(self, ev=None):
+            app = self.app
+            self.update_current_line()
+            self.gutter.schedule()
+            app.update_status()
+            self._match_brackets()
+            # Belt-and-suspenders: the <<Modified>> virtual event is delivered
+            # unreliably on some Tk builds (notably macOS Aqua), so also drive
+            # highlighting and auto-check straight from real key releases
+            # whenever the keystroke could have changed the text. This is what
+            # makes live hints and Tab fixes work on every platform.
+            if ev is not None and ev.keysym not in self._NON_EDIT_KEYS:
+                self._mark_dirty()
+                self._schedule_updates()
+            # Any key other than Tab breaks the inline completion cycle.
+            if ev is not None and ev.keysym != "Tab":
+                self._comp = None
+
+        def _on_click(self, ev=None):
+            self.app.hide_completion()
+            self.app.hide_hint()
+            self._comp = None
+            self.update_current_line()
+            self.gutter.schedule()
+            self.app.update_status()
+            self._match_brackets()
+
+        # ---- highlighting --------------------------------------------------
+
+        def _apply_highlight(self, seg_text, base_line, region_end=None):
+            t = self.text
+            toks = tokenize(seg_text, self.lang)
+            retype, _, _, _ = scan_brackets(seg_text, toks)
+            li = LineIndex(seg_text)
+            start = "%d.0" % base_line
+            end = region_end or "end"
+            for tag in ALL_TOKEN_TAGS:
+                t.tag_remove(tag, start, end)
+            b = base_line - 1
+            add = t.tag_add
+            for idx, (s, e, tt) in enumerate(toks):
+                if tt == "brk":
+                    tt = retype.get(idx, "brk0")
+                l1, c1 = li.line_col(s)
+                l2, c2 = li.line_col(e)
+                add(tt, "%d.%d" % (l1 + b, c1), "%d.%d" % (l2 + b, c2))
+
+        def highlight_all(self):
+            txt = self.get_text()
+            if len(txt) > 200000:
+                self.highlight_viewport()
+                return
+            self._apply_highlight(txt, 1)
+            self.gutter.schedule()
+
+        def highlight_viewport(self):
+            t = self.text
+            first = int(t.index("@0,0").split(".")[0])
+            h = max(t.winfo_height(), 120)
+            last = int(t.index("@0,%d" % h).split(".")[0])
+            a = max(1, first - 60)
+            z = last + 60
+            seg = t.get("%d.0" % a, "%d.end" % z)
+            self._apply_highlight(seg, a, region_end="%d.end" % z)
+            self.gutter.schedule()
+
+        def highlight_line_now(self):
+            t = self.text
+            ln = self.cur_line()
+            start = "%d.0" % ln
+            here = t.tag_names(start)
+            if "comment" in here or "string" in here or "codeblock" in here:
+                return
+            line = t.get(start, "%d.end" % ln)
+            toks = tokenize(line, self.lang)
+            retype, _, _, _ = scan_brackets(line, toks)
+            for tag in ALL_TOKEN_TAGS:
+                t.tag_remove(tag, start, "%d.end" % ln)
+            for idx, (s, e, tt) in enumerate(toks):
+                if tt == "brk":
+                    tt = retype.get(idx, "brk0")
+                t.tag_add(tt, "%d.%d" % (ln, s), "%d.%d" % (ln, e))
+            self.update_current_line()
+
+        # ---- auto-check ----------------------------------------------------
+
+        def _render_issues(self, issues):
+            """Paint the issue underlines and gutter markers."""
+            t = self.text
+            for tag in ISSUE_TAGS:
+                t.tag_remove(tag, "1.0", "end")
+            self.issue_lines = {}
+            last = int(t.index("end-1c").split(".")[0])
+            for iss in issues:
+                if iss.line < 1 or iss.line > last:
+                    continue
+                prev = self.issue_lines.get(iss.line)
+                if prev is None or SEV_ORDER[iss.severity] < SEV_ORDER[prev]:
+                    self.issue_lines[iss.line] = iss.severity
+                t.tag_add("iss_" + iss.severity,
+                          "%d.%d" % (iss.line, iss.col),
+                          "%d.%d" % (iss.line, max(iss.end, iss.col + 1)))
+            self.gutter.schedule()
+
+        def run_checks(self, show_hint=True):
+            self.check_error = None
+            if not self.app.autocheck:
+                self.issues = []
+                self._render_issues([])
+            elif linter_tool(self.lang) is not None:
+                # Compiler-backed language: keep the last precise diagnostics
+                # on screen and let the async linter refresh them. Re-running
+                # the quick built-in check here would briefly blank the real
+                # diagnostics between keystrokes (flicker), so we don't.
+                self._render_issues(self.issues)
+            else:
+                txt = self.get_text()
+                if len(txt) > 400000:
+                    self.issues = []
+                else:
+                    try:
+                        self.issues = check_source(txt, self.lang,
+                                                   self.path or self.title)
+                    except Exception as ex:
+                        # Never fail silently: remember the error so the status
+                        # bar shows it instead of a misleading "No problems".
+                        self.issues = []
+                        self.check_error = "%s: %s" % (type(ex).__name__, ex)
+                        _log_error("check_source", ex)
+                self._render_issues(self.issues)
+            if self is self.app.active_tab():
+                self.app.update_issue_ui()
+                if show_hint:
+                    self.maybe_show_hint()
+            # Kick the real compiler/checker in the background for precise
+            # diagnostics (offline).
+            self._kick_lint(show_hint)
+
+        # ---- external, compiler-grade diagnostics (async, offline) ---------
+
+        def _kick_lint(self, show_hint):
+            if not self.app.autocheck:
+                return
+            if linter_tool(self.lang) is None:
+                return
+            txt = self.get_text()
+            if not txt.strip():
+                # Buffer emptied - drop any stale diagnostics.
+                if self.issues:
+                    self.issues = []
+                    self._render_issues([])
+                    if self is self.app.active_tab():
+                        self.app.update_issue_ui()
+                return
+            if len(txt) > 150000:
+                return
+            self._lint_show_hint = show_hint
+            if self._lint_running:
+                self._lint_pending = True
+                return
+            self._lint_running = True
+            ver = self._version
+            lang = self.lang
+            threading.Thread(target=self._lint_thread,
+                             args=(ver, txt, lang), daemon=True).start()
+            self.after(70, self._poll_lint)
+
+        def _lint_thread(self, ver, txt, lang):
+            diags = run_linter(lang, txt)
+            self._lint_q.put((ver, lang, diags))
+
+        def _poll_lint(self):
+            try:
+                if not self.winfo_exists():
+                    self._lint_running = False
+                    return
+            except tk.TclError:
+                self._lint_running = False
+                return
+            try:
+                while True:
+                    self._on_lint_result(*self._lint_q.get_nowait())
+            except _queue.Empty:
+                pass
+            if self._lint_running:
+                self.after(70, self._poll_lint)
+
+        def _on_lint_result(self, ver, lang, diags):
+            self._lint_running = False
+            if lang == self.lang and ver == self._version:
+                self._apply_external(diags)
+            if self._lint_pending:
+                self._lint_pending = False
+                self._kick_lint(self._lint_show_hint)
+
+        def _apply_external(self, diags):
+            """Replace issues with the compiler's precise diagnostics."""
+            lines = self.get_text().split("\n")
+            issues = []
+            for l, c, sev, msg, fix in diags:
+                if l < 1 or l > len(lines):
+                    l, c = min(max(1, l), len(lines) or 1), 0
+                lt = lines[l - 1] if l - 1 < len(lines) else ""
+                c = max(0, min(c, len(lt)))
+                m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", lt[c:])
+                if m and m.group(0):
+                    end = c + len(m.group(0))
+                elif c >= len(lt):
+                    c = max(0, len(lt.rstrip()) - 1)
+                    end = len(lt) if lt else 1
+                else:
+                    end = len(lt)
+                issues.append(Issue(l, c, max(end, c + 1), sev,
+                                    msg, fix))
+            issues.sort(key=lambda i: (i.line, SEV_ORDER[i.severity], i.col))
+            self.issues = issues[:60]
+            self.check_error = None
+            self._render_issues(self.issues)
+            if self is self.app.active_tab():
+                self.app.update_issue_ui()
+                if self._lint_show_hint:
+                    self.maybe_show_hint()
+
+        def maybe_show_hint(self):
+            app = self.app
+            if not app.autocheck or not self.issues:
+                app.hide_hint()
+                return
+            ln = self.cur_line()
+            for iss in self.issues:
+                if iss.line == ln and iss.severity in ("error", "warn"):
+                    app.show_hint(self, iss)
+                    return
+            app.hide_hint()
+
+        def fix_issues(self, issues):
+            t = self.text
+            sp = LANGS[self.lang]
+            t.edit_separator()
+            changed = 0
+            for iss in sorted([i for i in issues if i.fix],
+                              key=lambda i: (-i.line, -i.col)):
+                kind, data = iss.fix
+                if kind == "append_eof":
+                    t.insert("end-1c", data)
+                    changed += 1
+                    continue
+                line = t.get("%d.0" % iss.line, "%d.end" % iss.line)
+                if kind == "rename_class":
+                    if iss.end <= len(line):
+                        new = line[:iss.col] + data + line[iss.end:]
+                    else:
+                        new = None
+                else:
+                    new = fixed_line_text(line, iss, sp)
+                if new is not None and new != line:
+                    t.delete("%d.0" % iss.line, "%d.end" % iss.line)
+                    t.insert("%d.0" % iss.line, new)
+                    changed += 1
+            if changed:
+                t.edit_separator()
+                self._mark_dirty()
+                self.highlight_all()
+                self.run_checks(show_hint=False)
+                self.app.refresh_outline_if_visible()
+            return changed
+
+        def fix_all(self):
+            issues = self.issues
+            if not any(i.fix for i in issues):
+                try:
+                    issues = check_source(self.get_text(), self.lang,
+                                          self.path or self.title)
+                except Exception as ex:
+                    _log_error("fix_all_check_source", ex)
+                    issues = self.issues
+            n = self.fix_issues(issues)
+            self.app.flash_status("Fixed %d issue%s" % (n, "" if n == 1 else "s")
+                                  if n else "Nothing to fix here")
+
+        # ---- placeholders (skeletons & snippets) ---------------------------
+
+        def _add_placeholder(self, a, b):
+            EditorTab._mark_seq[0] += 1
+            ms = "phs%d" % EditorTab._mark_seq[0]
+            me = "phe%d" % EditorTab._mark_seq[0]
+            self.text.mark_set(ms, a)
+            self.text.mark_gravity(ms, "left")
+            self.text.mark_set(me, b)
+            self.text.mark_gravity(me, "right")
+            self.placeholder_marks.append((ms, me))
+
+        def clear_placeholders(self):
+            for ms, me in self.placeholder_marks:
+                try:
+                    self.text.mark_unset(ms)
+                    self.text.mark_unset(me)
+                except tk.TclError:
+                    pass
+            self.placeholder_marks = []
+
+        def jump_placeholder(self):
+            t = self.text
+            while self.placeholder_marks:
+                ms, me = self.placeholder_marks.pop(0)
+                try:
+                    a = t.index(ms)
+                    b = t.index(me)
+                except tk.TclError:
+                    continue
+                t.mark_unset(ms)
+                t.mark_unset(me)
+                t.tag_remove("sel", "1.0", "end")
+                if a != b:
+                    t.tag_add("sel", a, b)
+                t.mark_set("insert", b)
+                t.see(b)
+                t.focus_set()
+                return True
+            return False
+
+        def expand_snippet(self, word, snip):
+            t = self.text
+            sp = LANGS[self.lang]
+            unit = indent_unit(sp)
+            upto = t.get("insert linestart", "insert")
+            base = re.match(r"[ \t]*", upto).group(0)
+            body = snip.replace("\t", unit).replace("\n", "\n" + base)
+            clean, spans = parse_placeholders(body)
+            self.clear_placeholders()
+            t.edit_separator()
+            t.delete("insert-%dc" % len(word), "insert")
+            anchor = t.index("insert")
+            t.insert("insert", clean)
+            for s, e in spans:
+                self._add_placeholder("%s+%dc" % (anchor, s),
+                                      "%s+%dc" % (anchor, e))
+            t.edit_separator()
+            self.jump_placeholder()
+            self.highlight_all()
+
+        # ---- smart keys ----------------------------------------------------
+
+        def _key_tab(self, ev=None):
+            app = self.app
+            t = self.text
+            pop = app.completion_popup
+            if pop and pop.winfo_exists():
+                app.accept_completion()
+                return "break"
+            if self.placeholder_marks and self.jump_placeholder():
+                return "break"
+            if t.tag_ranges("sel"):
+                self.indent_selection(1)
+                return "break"
+            sp = LANGS[self.lang]
+            unit = indent_unit(sp)
+            before = t.get("insert linestart", "insert")
+            if before.strip() == "":
+                t.insert("insert", unit)
+                return "break"
+            word = current_word(before)
+            after = t.get("insert", "insert lineend").strip()
+
+            # 1) Snippet: a bare keyword at the start of a line expands to a
+            #    template. This wins over auto-fix so 'for'+Tab expands the
+            #    loop rather than just tacking on a colon.
+            fam = LANGS[self.lang]["family"] or self.lang
+            snip = SNIPPETS.get(fam, {}).get(word)
+            if (snip and not after and
+                    before[:len(before) - len(word)].strip() == ""):
+                self.expand_snippet(word, snip)
+                return "break"
+
+            # 2) Auto-fix the problems on the current line (only when
+            #    auto-check is enabled).
+            if app.autocheck:
+                ln = self.cur_line()
+                fixables = [i for i in self.issues if i.line == ln and i.fix]
+                if fixables:
+                    had_colon = any(i.fix[0] == "colon" for i in fixables)
+                    if self.fix_issues(fixables):
+                        t.mark_set("insert", "%d.end" % ln)
+                        if had_colon:
+                            ind = re.match(
+                                r"[ \t]*",
+                                t.get("%d.0" % ln, "%d.end" % ln)).group(0)
+                            t.insert("insert", "\n" + ind + unit)
+                        t.see("insert")
+                        app.hide_hint()
+                        return "break"
+
+            # 3) Completion - always available, even with auto-check off.
+            #    Inline and popup-free so it works everywhere (macOS Aqua does
+            #    not render borderless popups reliably): the first Tab inserts
+            #    the best match, and each further Tab cycles to the next one.
+            try:
+                if self._complete(before, word):
+                    return "break"
+            except Exception as ex:
+                _log_error("complete", ex)
+
+            # 4) Nothing to complete here - just indent.
+            t.insert("insert", unit)
+            return "break"
+
+        def _complete(self, before, word):
+            """Inline, cycling completion. Returns True if it did something."""
+            t = self.text
+            c = self._comp
+            # Continue cycling if the last completion is still under the caret.
+            if (c and t.index("insert") == c["end"]
+                    and t.get(c["start"], "insert") == c["cands"][c["idx"]]):
+                c["idx"] = (c["idx"] + 1) % len(c["cands"])
+                t.edit_separator()
+                t.delete(c["start"], "insert")
+                t.insert(c["start"], c["cands"][c["idx"]])
+                c["end"] = t.index("insert")
+                self._comp_status()
+                return True
+            # Fresh completion: insert the best match, then let further Tabs
+            # cycle through the rest.
+            cands = compute_completions(self.get_text(), before, self.lang)
+            self._comp = None
+            if not cands:
+                return False
+            start = (t.index("insert-%dc" % len(word)) if word
+                     else t.index("insert"))
+            t.edit_separator()
+            if word:
+                t.delete(start, "insert")
+            t.insert(start, cands[0])
+            if len(cands) > 1:
+                self._comp = {"start": start, "cands": cands, "idx": 0,
+                              "end": t.index("insert")}
+                self._comp_status()
+            return True
+
+        def _comp_status(self):
+            c = self._comp
+            if c and self is self.app.active_tab():
+                self.app.flash_status(
+                    "%s   ▸ %d of %d   (Tab to cycle)"
+                    % (c["cands"][c["idx"]], c["idx"] + 1, len(c["cands"])))
+
+        def _clear_completion(self):
+            self._comp = None
+
+        def _key_shift_tab(self, ev=None):
+            self.indent_selection(-1)
+            return "break"
+
+        def indent_selection(self, d):
+            t = self.text
+            sp = LANGS[self.lang]
+            unit = indent_unit(sp)
+            had_sel = True
+            try:
+                a = int(t.index("sel.first").split(".")[0])
+                bidx = t.index("sel.last")
+                b = int(bidx.split(".")[0])
+                if int(bidx.split(".")[1]) == 0 and b > a:
+                    b -= 1
+            except tk.TclError:
+                a = b = self.cur_line()
+                had_sel = False
+            t.edit_separator()
+            for ln in range(a, b + 1):
+                line = t.get("%d.0" % ln, "%d.end" % ln)
+                if d > 0:
+                    if line.strip() or not had_sel:
+                        t.insert("%d.0" % ln, unit)
+                else:
+                    if line.startswith(unit):
+                        t.delete("%d.0" % ln, "%d.%d" % (ln, len(unit)))
+                    elif line.startswith("\t"):
+                        t.delete("%d.0" % ln, "%d.1" % ln)
+                    else:
+                        m = re.match(r" {1,%d}" % sp["indent"], line)
+                        if m:
+                            t.delete("%d.0" % ln, "%d.%d" % (ln, m.end()))
+            t.edit_separator()
+            if had_sel:
+                t.tag_add("sel", "%d.0" % a, "%d.end" % b)
+
+        def _key_return(self, ev=None):
+            app = self.app
+            t = self.text
+            pop = app.completion_popup
+            if pop and pop.winfo_exists():
+                app.accept_completion()
+                return "break"
+            if t.tag_ranges("sel"):
+                t.delete("sel.first", "sel.last")
+            t.edit_separator()
+            sp = LANGS[self.lang]
+            unit = indent_unit(sp)
+            before = t.get("insert linestart", "insert")
+            after = t.get("insert", "insert lineend")
+            ind = re.match(r"[ \t]*", before).group(0)
+            code = split_code_comment(before, sp["line_comment"])[0].rstrip()
+            extra = ""
+            if self.lang == "python" and code.endswith(":"):
+                extra = unit
+            elif code and code[-1] in BRK_PAIR:
+                extra = unit
+                closer = BRK_PAIR[code[-1]]
+                if after.lstrip().startswith(closer):
+                    t.insert("insert", "\n" + ind + extra + "\n" + ind)
+                    t.mark_set("insert", "insert-%dc" % (len(ind) + 1))
+                    t.see("insert")
+                    app.hide_hint()
+                    return "break"
+            elif self.lang == "python" and code.strip():
+                w = code.strip().split(" ")[0]
+                if (w in ("return", "pass", "break", "continue", "raise")
+                        and len(ind) >= len(unit)):
+                    ind = ind[:len(ind) - len(unit)]
+            t.insert("insert", "\n" + ind + extra)
+            t.see("insert")
+            app.hide_completion()
+            return "break"
+
+        def _key_backspace(self, ev=None):
+            t = self.text
+            if t.tag_ranges("sel"):
+                return None
+            prev = t.get("insert-1c", "insert")
+            nxt = t.get("insert", "insert+1c")
+            if prev and prev + nxt in ("()", "[]", "{}", '""', "''", "``"):
+                t.delete("insert-1c", "insert+1c")
+                return "break"
+            before = t.get("insert linestart", "insert")
+            sp = LANGS[self.lang]
+            if before and before.strip() == "" and sp["indent_char"] == " ":
+                w = sp["indent"]
+                back = len(before) % w or w
+                if back > 1 and len(before) >= back:
+                    t.delete("insert-%dc" % back, "insert")
+                    return "break"
+            return None
+
+        def _key_escape(self, ev=None):
+            app = self.app
+            app.hide_completion()
+            app.hide_hint()
+            self.clear_placeholders()
+            self.text.tag_remove("find_match", "1.0", "end")
+            app.hide_findbar()
+            return "break"
+
+        def _key_updown(self, d):
+            pop = self.app.completion_popup
+            if pop and pop.winfo_exists():
+                pop.move(d)
+                return "break"
+            return None
+
+        def _key_open(self, ev, ch, close):
+            if ev.char != ch:
+                return None
+            t = self.text
+            if t.tag_ranges("sel"):
+                s = t.index("sel.first")
+                e = t.index("sel.last")
+                t.insert(e, close)
+                t.insert(s, ch)
+                t.tag_remove("sel", "1.0", "end")
+                t.mark_set("insert", "%s+2c" % e)
+                return "break"
+            t.insert("insert", ch + close)
+            t.mark_set("insert", "insert-1c")
+            return "break"
+
+        def _key_close(self, ev, ch):
+            if ev.char != ch:
+                return None
+            t = self.text
+            if t.get("insert", "insert+1c") == ch:
+                t.mark_set("insert", "insert+1c")
+                return "break"
+            sp = LANGS[self.lang]
+            before = t.get("insert linestart", "insert")
+            if (ch == "}" and before and before.strip() == ""
+                    and sp["indent_char"] == " "):
+                back = len(before) % sp["indent"] or sp["indent"]
+                if len(before) >= back:
+                    t.delete("insert-%dc" % back, "insert")
+            return None
+
+        def _key_quote(self, ev, q):
+            if ev.char != q:
+                return None
+            sp = LANGS[self.lang]
+            if q == "`":
+                if not sp["backtick"] and self.lang != "markdown":
+                    return None
+            elif q not in sp["strings"]:
+                return None
+            t = self.text
+            if t.tag_ranges("sel"):
+                s = t.index("sel.first")
+                e = t.index("sel.last")
+                t.insert(e, q)
+                t.insert(s, q)
+                t.tag_remove("sel", "1.0", "end")
+                t.mark_set("insert", "%s+2c" % e)
+                return "break"
+            if t.get("insert", "insert+1c") == q:
+                t.mark_set("insert", "insert+1c")
+                return "break"
+            tags = t.tag_names("insert")
+            if "comment" in tags or "string" in tags:
+                return None
+            prev = t.get("insert-1c", "insert")
+            if q == "'" and (prev.isalnum() or prev == "'"):
+                return None
+            t.insert("insert", q + q)
+            t.mark_set("insert", "insert-1c")
+            return "break"
+
+        # ---- brackets match, goto, comments --------------------------------
+
+        def _match_brackets(self):
+            t = self.text
+            t.tag_remove("brk_match", "1.0", "end")
+            for probe in ("insert-1c", "insert"):
+                ch = t.get(probe, "%s+1c" % probe)
+                if ch in "()[]{}":
+                    txt = self.get_text()
+                    if len(txt) > 200000:
+                        return
+                    pos = len(t.get("1.0", probe))
+                    part = self._find_partner(txt, pos)
+                    if part is not None:
+                        li = LineIndex(txt)
+                        for p in (pos, part):
+                            t.tag_add("brk_match", li.tk(p),
+                                      "%s+1c" % li.tk(p))
+                    return
+
+        @staticmethod
+        def _find_partner(txt, pos):
+            ch = txt[pos]
+            if ch in BRK_PAIR:
+                target, rng = BRK_PAIR[ch], range(pos + 1,
+                                                  min(len(txt), pos + 20000))
+            else:
+                target, rng = BRK_MATCH[ch], range(pos - 1,
+                                                   max(-1, pos - 20000), -1)
+            depth = 0
+            for i in rng:
+                c = txt[i]
+                if c == ch:
+                    depth += 1
+                elif c == target:
+                    if depth == 0:
+                        return i
+                    depth -= 1
+            return None
+
+        def goto_line(self, n):
+            t = self.text
+            n = max(1, min(n, int(t.index("end-1c").split(".")[0])))
+            t.mark_set("insert", "%d.0" % n)
+            t.see("insert")
+            t.focus_set()
+            self.update_current_line()
+            self.gutter.schedule()
+
+        def goto_issue(self, iss):
+            t = self.text
+            t.mark_set("insert", "%d.%d" % (iss.line, iss.col))
+            t.see("insert")
+            t.focus_set()
+            self.update_current_line()
+            self.gutter.schedule()
+
+        def toggle_comment(self):
+            t = self.text
+            sp = LANGS[self.lang]
+            lc = sp["line_comment"]
+            try:
+                a = int(t.index("sel.first").split(".")[0])
+                bidx = t.index("sel.last")
+                b = int(bidx.split(".")[0])
+                if int(bidx.split(".")[1]) == 0 and b > a:
+                    b -= 1
+            except tk.TclError:
+                a = b = self.cur_line()
+            t.edit_separator()
+            if lc:
+                lines = [t.get("%d.0" % ln, "%d.end" % ln)
+                         for ln in range(a, b + 1)]
+                nonblank = [l for l in lines if l.strip()]
+                all_comm = bool(nonblank) and all(
+                    l.lstrip().startswith(lc) for l in nonblank)
+                if all_comm:
+                    for i, ln in enumerate(range(a, b + 1)):
+                        l = lines[i]
+                        if not l.strip():
+                            continue
+                        p = l.index(lc)
+                        w = len(lc)
+                        if l[p + w:p + w + 1] == " ":
+                            w += 1
+                        t.delete("%d.%d" % (ln, p), "%d.%d" % (ln, p + w))
+                else:
+                    ind = min((len(l) - len(l.lstrip()) for l in nonblank),
+                              default=0)
+                    for ln in range(a, b + 1):
+                        if t.get("%d.0" % ln, "%d.end" % ln).strip():
+                            t.insert("%d.%d" % (ln, ind), lc + " ")
+            elif sp["block_comment"]:
+                o, c = sp["block_comment"]
+                for ln in range(a, b + 1):
+                    line = t.get("%d.0" % ln, "%d.end" % ln)
+                    st = line.strip()
+                    if not st:
+                        continue
+                    ind = line[:len(line) - len(line.lstrip())]
+                    if st.startswith(o) and st.endswith(c):
+                        inner = st[len(o):len(st) - len(c)].strip()
+                        new = ind + inner
+                    else:
+                        new = ind + o + " " + st + " " + c
+                    t.delete("%d.0" % ln, "%d.end" % ln)
+                    t.insert("%d.0" % ln, new)
+            t.edit_separator()
+            self.highlight_all()
+            self.run_checks(show_hint=False)
+
+        # ---- saving --------------------------------------------------------
+
+        def save_to(self, path):
+            txt = self.get_text()
+            data = txt if (not txt or txt.endswith("\n")) else txt + "\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+            self.path = path
+            self.title = os.path.basename(path)
+            new_lang = detect_language(path, txt.split("\n", 1)[0])
+            if new_lang != "text" and new_lang != self.lang:
+                self.set_language(new_lang)
+            self.dirty = False
+            return True
+
+        def set_language(self, lang_id):
+            if lang_id not in LANGS:
+                return
+            self.lang = lang_id
+            self.apply_font()
+            self.highlight_all()
+            self.run_checks(show_hint=False)
+            self.app.update_status()
+            self.app.refresh_outline_if_visible()
+
+    class OutputPanel(tk.Frame):
+        """Run/Debug console with live output and an interactive stdin box."""
+
+        def __init__(self, master, app):
+            super().__init__(master, bg=THEME["bg_panel"])
+            self.app = app
+            self.visible = False
+            head = tk.Frame(self, bg=THEME["bg_panel"])
+            head.pack(fill="x")
+            tk.Label(head, text="OUTPUT", bg=THEME["bg_panel"],
+                     fg=THEME["fg_dim"], font=app.small_font)\
+                .pack(side="left", padx=(10, 6), pady=2)
+            self.state_lbl = tk.Label(head, text="", bg=THEME["bg_panel"],
+                                      fg=THEME["fg_dim"], font=app.small_font)
+            self.state_lbl.pack(side="left")
+            FlatButton(head, "✕", self.hide, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", padx=(0, 6), pady=2)
+            FlatButton(head, "Clear", self.clear, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", pady=2)
+            mid = tk.Frame(self, bg=THEME["bg_panel"])
+            mid.pack(fill="both", expand=True)
+            self.text = tk.Text(mid, height=11, bg="#0a100d", fg=THEME["fg"],
+                                bd=0, highlightthickness=0, wrap="word",
+                                state="disabled", font=app.mono_font,
+                                padx=9, pady=6,
+                                insertbackground=THEME["caret"],
+                                selectbackground=THEME["sel"])
+            vs = tk.Scrollbar(mid, orient="vertical", command=self.text.yview)
+            self.text.configure(yscrollcommand=vs.set)
+            self.text.pack(side="left", fill="both", expand=True)
+            vs.pack(side="right", fill="y")
+            self.text.tag_configure("out", foreground=THEME["fg"])
+            self.text.tag_configure("err", foreground=THEME["error"])
+            self.text.tag_configure("info", foreground=THEME["info"])
+            self.text.tag_configure("cmd", foreground=THEME["fg_dim"])
+            self.text.tag_configure("in", foreground=THEME["accent"])
+            self.text.tag_configure("ok", foreground=THEME["ok"])
+            row = tk.Frame(self, bg=THEME["bg_panel"])
+            row.pack(fill="x")
+            tk.Label(row, text="stdin ▸", bg=THEME["bg_panel"],
+                     fg=THEME["fg_dim"], font=app.small_font)\
+                .pack(side="left", padx=(10, 4))
+            self.entry = tk.Entry(row, bg=THEME["bg_input"], fg=THEME["fg"],
+                                  insertbackground=THEME["caret"], bd=0,
+                                  highlightthickness=1,
+                                  highlightbackground=THEME["border"],
+                                  highlightcolor=THEME["accent_dark"],
+                                  font=app.mono_font)
+            self.entry.pack(side="left", fill="x", expand=True, pady=4)
+            self.entry.bind("<Return>", self.send)
+            FlatButton(row, "Send", self.send, font=app.small_font,
+                       padx=8, pady=1).pack(side="left", padx=6)
+
+        def show(self):
+            if not self.visible:
+                self.grid()
+                self.visible = True
+
+        def hide(self):
+            if self.visible:
+                self.grid_remove()
+                self.visible = False
+
+        def toggle(self):
+            (self.hide if self.visible else self.show)()
+
+        def clear(self):
+            self.text.configure(state="normal")
+            self.text.delete("1.0", "end")
+            self.text.configure(state="disabled")
+
+        def append(self, tag, s):
+            t = self.text
+            t.configure(state="normal")
+            t.insert("end", s, (tag,))
+            if len(t.get("1.0", "end-1c")) > 400000:
+                t.delete("1.0", "1.0+100000c")
+            t.see("end")
+            t.configure(state="disabled")
+
+        def begin_static(self, title):
+            self.show()
+            self.append("cmd", "\n── %s ──\n" % title)
+            self.state_lbl.config(text="")
+
+        def begin_run(self, name, debug):
+            self.show()
+            what = "Debug" if debug else "Run"
+            self.append("cmd", "\n── %s %s · %s ──\n"
+                        % (what, name, time.strftime("%H:%M:%S")))
+            self.state_lbl.config(text="running…", fg=THEME["warn"])
+            self.entry.focus_set()
+
+        def poll(self, runner):
+            if runner is not self.app.runner:
+                return
+            for _ in range(300):
+                try:
+                    ev = runner.events.get_nowait()
+                except _queue.Empty:
+                    break
+                if ev[0] == "done":
+                    rc, secs = ev[1], ev[2]
+                    tag = "ok" if rc == 0 else "err"
+                    self.append(tag, "\n[finished with exit code %d in %.2fs]\n"
+                                % (rc, secs))
+                    self.state_lbl.config(
+                        text="done (%d)" % rc,
+                        fg=THEME["ok"] if rc == 0 else THEME["error"])
+                    self.app.runner = None
+                    return
+                self.append(ev[0], ev[1])
+            self.after(50, lambda: self.poll(runner))
+
+        def send(self, ev=None):
+            line = self.entry.get()
+            self.entry.delete(0, "end")
+            r = self.app.runner
+            if r and r.alive():
+                self.append("in", "▸ %s\n" % line)
+                r.send_line(line)
+            else:
+                self.append("info", "No program is waiting for input.\n")
+
+    class FindBar(tk.Frame):
+        def __init__(self, master, app):
+            super().__init__(master, bg=THEME["bg_panel"])
+            self.app = app
+            self.matches = []
+            self.at = -1
+            self.case = False
+
+            def mk_entry():
+                e = tk.Entry(self, bg=THEME["bg_input"], fg=THEME["fg"],
+                             insertbackground=THEME["caret"], bd=0,
+                             highlightthickness=1, width=22,
+                             highlightbackground=THEME["border"],
+                             highlightcolor=THEME["accent_dark"],
+                             font=app.small_font)
+                return e
+            tk.Label(self, text="Find", bg=THEME["bg_panel"], fg=THEME["fg_dim"],
+                     font=app.small_font).pack(side="left", padx=(10, 4), pady=5)
+            self.find_e = mk_entry()
+            self.find_e.pack(side="left", pady=5)
+            self.count_lbl = tk.Label(self, text="", bg=THEME["bg_panel"],
+                                      fg=THEME["fg_dim"], font=app.small_font)
+            self.count_lbl.pack(side="left", padx=6)
+            self.case_btn = FlatButton(self, "Aa", self.toggle_case,
+                                       font=app.small_font, padx=6, pady=1)
+            self.case_btn.pack(side="left", padx=2, pady=4)
+            FlatButton(self, "◀", lambda: self.step(-1), font=app.small_font,
+                       padx=6, pady=1).pack(side="left", padx=2, pady=4)
+            FlatButton(self, "▶", lambda: self.step(1), font=app.small_font,
+                       padx=6, pady=1).pack(side="left", padx=2, pady=4)
+            tk.Label(self, text="Replace", bg=THEME["bg_panel"],
+                     fg=THEME["fg_dim"], font=app.small_font)\
+                .pack(side="left", padx=(14, 4))
+            self.rep_e = mk_entry()
+            self.rep_e.pack(side="left", pady=5)
+            FlatButton(self, "Replace", self.replace_one, font=app.small_font,
+                       padx=7, pady=1).pack(side="left", padx=3, pady=4)
+            FlatButton(self, "All", self.replace_all, font=app.small_font,
+                       padx=7, pady=1).pack(side="left", pady=4)
+            FlatButton(self, "✕", self.hide, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", padx=8, pady=4)
+            for e in (self.find_e, self.rep_e):
+                e.bind("<Escape>", lambda ev: self.hide())
+            self.find_e.bind("<KeyRelease>", self._typed)
+            self.find_e.bind("<Return>", lambda ev: self.step(1))
+            self.find_e.bind("<Shift-Return>", lambda ev: self.step(-1))
+            self.rep_e.bind("<Return>", lambda ev: self.replace_one())
+
+        def toggle_case(self):
+            self.case = not self.case
+            self.case_btn.configure(
+                fg=THEME["accent"] if self.case else THEME["fg"])
+            self.case_btn.c_fg = (THEME["accent"] if self.case
+                                  else THEME["fg"])
+            self.search()
+
+        def show(self):
+            tab = self.app.active_tab()
+            if not tab:
+                return
+            if not self.winfo_manager():
+                self.pack(fill="x", before=self.app.body)
+            try:
+                sel = tab.text.get("sel.first", "sel.last")
+                if sel and "\n" not in sel:
+                    self.find_e.delete(0, "end")
+                    self.find_e.insert(0, sel)
+            except tk.TclError:
+                pass
+            self.find_e.focus_set()
+            self.find_e.select_range(0, "end")
+            self.search()
+
+        def hide(self):
+            if self.winfo_manager():
+                self.pack_forget()
+            tab = self.app.active_tab()
+            if tab:
+                tab.text.tag_remove("find_match", "1.0", "end")
+                tab.text.focus_set()
+
+        def _typed(self, ev=None):
+            if ev and ev.keysym in ("Return", "Shift_L", "Shift_R", "Escape"):
+                return
+            self.search()
+
+        def _pattern(self):
+            return self.find_e.get()
+
+        def search(self):
+            tab = self.app.active_tab()
+            if not tab:
+                return
+            t = tab.text
+            t.tag_remove("find_match", "1.0", "end")
+            self.matches = []
+            self.at = -1
+            pat = self._pattern()
+            if not pat:
+                self.count_lbl.config(text="")
+                return
+            use_re = pat.startswith("-")
+            if use_re:
+                pat_s = "".join(ch if ch.isalnum() else "\\" + ch for ch in pat)
+            else:
+                pat_s = pat
+            idx = "1.0"
+            for _ in range(3000):
+                idx = t.search(pat_s, idx, stopindex="end",
+                               nocase=not self.case, regexp=use_re)
+                if not idx:
+                    break
+                end = "%s+%dc" % (idx, len(pat))
+                t.tag_add("find_match", idx, end)
+                self.matches.append(idx)
+                idx = end
+            n = len(self.matches)
+            self.count_lbl.config(text="%d match%s" % (n, "" if n == 1 else "es"))
+
+        def step(self, d):
+            if not self.matches:
+                self.search()
+            if not self.matches:
+                return
+            tab = self.app.active_tab()
+            if not tab:
+                return
+            t = tab.text
+            self.at = (self.at + d) % len(self.matches)
+            idx = self.matches[self.at]
+            end = "%s+%dc" % (idx, len(self._pattern()))
+            t.tag_remove("sel", "1.0", "end")
+            t.tag_add("sel", idx, end)
+            t.mark_set("insert", end)
+            t.see(idx)
+            tab.update_current_line()
+            tab.gutter.schedule()
+            self.count_lbl.config(text="%d of %d"
+                                  % (self.at + 1, len(self.matches)))
+
+        def replace_one(self):
+            tab = self.app.active_tab()
+            if not tab or not self._pattern():
+                return
+            t = tab.text
+            pat = self._pattern()
+            try:
+                sel = t.get("sel.first", "sel.last")
+            except tk.TclError:
+                sel = ""
+            same = (sel == pat) if self.case else (sel.lower() == pat.lower())
+            if same and sel:
+                t.edit_separator()
+                t.delete("sel.first", "sel.last")
+                t.insert("insert", self.rep_e.get())
+                t.edit_separator()
+                self.search()
+            self.step(1)
+
+        def replace_all(self):
+            tab = self.app.active_tab()
+            pat = self._pattern()
+            if not tab or not pat:
+                return
+            t = tab.text
+            rep = self.rep_e.get()
+            t.edit_separator()
+            idx = "1.0"
+            n = 0
+            for _ in range(20000):
+                idx = t.search(pat, idx, stopindex="end", nocase=not self.case)
+                if not idx:
+                    break
+                t.delete(idx, "%s+%dc" % (idx, len(pat)))
+                t.insert(idx, rep)
+                idx = "%s+%dc" % (idx, len(rep))
+                n += 1
+            t.edit_separator()
+            self.search()
+            self.app.flash_status("Replaced %d occurrence%s"
+                                  % (n, "" if n == 1 else "s"))
+            tab.highlight_all()
+            tab.run_checks(show_hint=False)
+
+    class OutlinePane(tk.Frame):
+        """Left-side source outline for fast jumps in large files."""
+
+        def __init__(self, master, app):
+            super().__init__(master, bg=THEME["bg_panel"], width=250)
+            self.app = app
+            self.visible = False
+            self.pack_propagate(False)
+            head = tk.Frame(self, bg=THEME["bg_panel"])
+            head.pack(fill="x")
+            tk.Label(head, text="OUTLINE", bg=THEME["bg_panel"],
+                     fg=THEME["fg_dim"], font=app.small_font)\
+                .pack(side="left", padx=(10, 6), pady=6)
+            FlatButton(head, "Refresh", self.refresh, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", pady=4)
+            FlatButton(head, "✕", self.hide, font=app.small_font,
+                       padx=7, pady=1).pack(side="right", padx=(0, 4), pady=4)
+            wrap = tk.Frame(self, bg=THEME["bg_panel"])
+            wrap.pack(fill="both", expand=True)
+            self.canvas = tk.Canvas(wrap, bg=THEME["bg_panel"],
+                                    highlightthickness=0, bd=0)
+            self.scroll = tk.Scrollbar(wrap, orient="vertical",
+                                       command=self.canvas.yview)
+            self.inner = tk.Frame(self.canvas, bg=THEME["bg_panel"])
+            self.canvas.configure(yscrollcommand=self.scroll.set)
+            self.canvas.pack(side="left", fill="both", expand=True)
+            self.scroll.pack(side="right", fill="y")
+            self.window = self.canvas.create_window((0, 0), window=self.inner,
+                                                    anchor="nw")
+            self.inner.bind("<Configure>", lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")))
+            self.canvas.bind("<Configure>", lambda e:
+                             self.canvas.itemconfigure(self.window, width=e.width))
+
+        def show(self):
+            if not self.visible:
+                self.pack(side="left", fill="y", before=self.app.editor_area)
+                self.visible = True
+            self.refresh()
+
+        def hide(self):
+            if self.visible:
+                self.pack_forget()
+                self.visible = False
+
+        def toggle(self):
+            (self.hide if self.visible else self.show)()
+
+        def refresh(self):
+            for w in self.inner.winfo_children():
+                w.destroy()
+            tab = self.app.active_tab()
+            if not tab:
+                self._empty("Open a file to see its outline.")
+                return
+            items = outline_items(tab.get_text(), tab.lang)
+            if not items:
+                self._empty("No outline items in this file yet.")
+                return
+            for item in items:
+                self._row(tab, item)
+
+        def _empty(self, text):
+            tk.Label(self.inner, text=text, bg=THEME["bg_panel"],
+                     fg=THEME["fg_faint"], font=self.app.small_font,
+                     justify="left", wraplength=210)\
+                .pack(anchor="w", padx=12, pady=10)
+
+        def _row(self, tab, item):
+            row = tk.Frame(self.inner, bg=THEME["bg_panel"], cursor="hand2")
+            row.pack(fill="x", padx=4, pady=1)
+            pad = 8 + item.level * 14
+            text = "%4d  %s %s" % (item.line, item.kind, item.name)
+            lbl = tk.Label(row, text=text, anchor="w", bg=THEME["bg_panel"],
+                           fg=THEME["fg"], font=self.app.small_font,
+                           cursor="hand2", padx=pad, pady=3)
+            lbl.pack(fill="x")
+
+            def jump(ev=None, line=item.line, tb=tab):
+                self.app.activate(tb)
+                tb.goto_line(line)
+            for w in (row, lbl):
+                w.bind("<Button-1>", jump)
+                w.bind("<Enter>", lambda e, ww=w: ww.configure(bg=THEME["bg_hover"]))
+                w.bind("<Leave>", lambda e, ww=w: ww.configure(bg=THEME["bg_panel"]))
+
+    class HomePane(tk.Frame):
+        """Welcome screen: new file, open file, recent files."""
+
+        def __init__(self, master, app):
+            super().__init__(master, bg=THEME["bg"])
+            self.app = app
+            self.inner = tk.Frame(self, bg=THEME["bg"])
+            self.inner.place(relx=0.5, rely=0.44, anchor="center")
+
+        def _gecko(self, cv):
+            g1, g2 = THEME["accent"], THEME["accent_dark"]
+            cv.create_arc(6, 44, 66, 102, start=100, extent=225, style="arc",
+                          outline=g2, width=7)
+            cv.create_oval(38, 48, 106, 92, fill=g1, outline="")
+            cv.create_oval(88, 30, 126, 68, fill=g1, outline="")
+            for x, y in ((52, 86), (84, 86)):
+                cv.create_line(x, y, x - 8, y + 14, fill=g2, width=5,
+                               capstyle="round")
+                cv.create_line(x + 14, y, x + 22, y + 14, fill=g2, width=5,
+                               capstyle="round")
+            cv.create_oval(106, 41, 115, 50, fill="#0c110f", outline="")
+            cv.create_oval(111, 43, 114, 46, fill="#eafff2", outline="")
+            for x, y in ((56, 60), (72, 68), (62, 76)):
+                cv.create_oval(x, y, x + 6, y + 6, fill=g2, outline="")
+
+        def refresh(self):
+            app = self.app
+            for w in self.inner.winfo_children():
+                w.destroy()
+            cv = tk.Canvas(self.inner, width=136, height=116, bg=THEME["bg"],
+                           highlightthickness=0)
+            cv.pack()
+            self._gecko(cv)
+            tk.Label(self.inner, text=APP, bg=THEME["bg"], fg=THEME["fg"],
+                     font=app.ui_big).pack(pady=(4, 0))
+            tk.Label(self.inner,
+                     text="Write code fast — colorful, smart, 100% offline.",
+                     bg=THEME["bg"], fg=THEME["fg_dim"],
+                     font=app.ui_font).pack(pady=(2, 16))
+            row = tk.Frame(self.inner, bg=THEME["bg"])
+            row.pack()
+            mod = "⌘" if IS_MAC else "Ctrl+"
+            FlatButton(row, "＋  New File   (%sN)" % mod,
+                       app.new_file_dialog, "primary", padx=18, pady=9,
+                       font=app.ui_font).pack(side="left", padx=6)
+            FlatButton(row, "📂  Open File…   (%sO)" % mod,
+                       app.open_dialog, "ghost", padx=18, pady=9,
+                       font=app.ui_font).pack(side="left", padx=6)
+            recents = [p for p in app.settings.get("recent", [])
+                       if os.path.exists(p)][:6]
+            if recents:
+                tk.Label(self.inner, text="RECENT", bg=THEME["bg"],
+                         fg=THEME["fg_faint"], font=app.small_font)\
+                    .pack(pady=(22, 4))
+                for p in recents:
+                    r = tk.Frame(self.inner, bg=THEME["bg"], cursor="hand2")
+                    r.pack(fill="x", pady=1)
+                    a = tk.Label(r, text=os.path.basename(p), bg=THEME["bg"],
+                                 fg=THEME["accent"], font=app.ui_font)
+                    a.pack(side="left")
+                    b = tk.Label(r, text="  " + shorten_home(os.path.dirname(p)),
+                                 bg=THEME["bg"], fg=THEME["fg_faint"],
+                                 font=app.small_font)
+                    b.pack(side="left")
+                    for w in (r, a, b):
+                        w.bind("<Button-1>",
+                               lambda e, pp=p: app.open_path(pp))
+                        w.bind("<Enter>",
+                               lambda e, aa=a: aa.configure(fg="#7fe9b8"))
+                        w.bind("<Leave>",
+                               lambda e, aa=a: aa.configure(fg=THEME["accent"]))
+            tk.Label(self.inner,
+                     text="Tab auto-completes and auto-fixes  ·  hints appear "
+                          "as you type  ·  %sR runs your code" % mod,
+                     bg=THEME["bg"], fg=THEME["fg_faint"],
+                     font=app.small_font).pack(pady=(26, 0))
+
+    class GeskoApp(tk.Tk):
+        def __init__(self, paths=()):
+            super().__init__()
+            self.title(APP)
+            self.configure(bg=THEME["bg"])
+            self.settings = self._load_settings()
+            self.geometry(self.settings.get("geometry") or "1180x760")
+            self.minsize(860, 540)
+
+            fam = pick_family(self, ("SF Mono", "Menlo", "Monaco",
+                                     "JetBrains Mono", "Fira Code",
+                                     "Cascadia Code", "Consolas",
+                                     "DejaVu Sans Mono", "Ubuntu Mono",
+                                     "Liberation Mono", "Courier New"),
+                              "Courier")
+            size = int(self.settings.get("font_size", 13))
+            self.mono_font = tkfont.Font(family=fam, size=size)
+            self.mono_bold = tkfont.Font(family=fam, size=size, weight="bold")
+            self.mono_italic = tkfont.Font(family=fam, size=size,
+                                           slant="italic")
+            ufam = pick_family(self, ("Helvetica Neue", "SF Pro Text",
+                                      "Segoe UI", "DejaVu Sans", "Helvetica",
+                                      "Arial"), "Helvetica")
+            self.ui_font = tkfont.Font(family=ufam, size=13)
+            self.ui_big = tkfont.Font(family=ufam, size=30, weight="bold")
+            self.small_font = tkfont.Font(family=ufam, size=11)
+
+            self.autocheck = bool(self.settings.get("autocheck", True))
+            self.autocheck_var = tk.BooleanVar(value=self.autocheck)
+            self.tabs = []
+            self._active = None
+            self.completion_popup = None
+            self._completion_ctx = None
+            self.hint_popup = None
+            self._hint_key = None
+            self.runner = None
+            self._flash_job = None
+
+            self._build_menu()
+            self._build_ui()
+            self._bind_keys()
+            self._set_icon()
+            self.protocol("WM_DELETE_WINDOW", self.quit_app)
+            if IS_MAC:
+                for cmd, fn in (("tk::mac::Quit", self.quit_app),
+                                ("tk::mac::OpenDocument", self._mac_open_docs)):
+                    try:
+                        self.createcommand(cmd, fn)
+                    except tk.TclError:
+                        pass
+
+            opened = False
+            for p in paths:
+                if os.path.exists(p):
+                    self.open_path(os.path.abspath(p))
+                    opened = True
+            if not opened:
+                self.show_home()
+
+        # ---- construction --------------------------------------------------
+
+        def _build_ui(self):
+            self.topbar = tk.Frame(self, bg=THEME["bg_panel"])
+            self.topbar.pack(side="top", fill="x")
+            right = tk.Frame(self.topbar, bg=THEME["bg_panel"])
+            right.pack(side="right", padx=6)
+            FlatButton(right, "▶ Run", self.run_active, "primary",
+                       font=self.small_font, padx=10, pady=3)\
+                .pack(side="left", padx=3, pady=4)
+            FlatButton(right, "◆ Debug", lambda: self.run_active(True),
+                       font=self.small_font, padx=10, pady=3)\
+                .pack(side="left", padx=3, pady=4)
+            FlatButton(right, "■ Stop", self.stop_run,
+                       font=self.small_font, padx=10, pady=3)\
+                .pack(side="left", padx=3, pady=4)
+            FlatButton(self.topbar, "☰ Outline", self.toggle_outline,
+                       font=self.small_font, padx=10, pady=3)\
+                .pack(side="left", padx=(6, 3), pady=4)
+            self.tabrow = tk.Frame(self.topbar, bg=THEME["bg_panel"])
+            self.tabrow.pack(side="left", fill="x", expand=True)
+
+            bottom = tk.Frame(self, bg=THEME["bg"])
+            bottom.pack(side="bottom", fill="x")
+            bottom.columnconfigure(0, weight=1)
+            self.output = OutputPanel(bottom, self)
+            self.output.grid(row=0, column=0, sticky="ew")
+            self.output.grid_remove()
+            self.hintbar = tk.Frame(bottom, bg=THEME["bg_panel"])
+            self.hintbar.grid(row=1, column=0, sticky="ew")
+            self.hintbar.grid_remove()
+            self.status = tk.Frame(bottom, bg=THEME["bg_status"])
+            self.status.grid(row=2, column=0, sticky="ew")
+            self._build_status()
+
+            self.body = tk.Frame(self, bg=THEME["bg"])
+            self.body.pack(side="top", fill="both", expand=True)
+            self.outline = OutlinePane(self.body, self)
+            self.editor_area = tk.Frame(self.body, bg=THEME["bg"])
+            self.editor_area.pack(side="left", fill="both", expand=True)
+            self.findbar = FindBar(self, self)
+            self.home = HomePane(self.editor_area, self)
+
+        def _build_status(self):
+            s = self.status
+            self.st_issues = tk.Label(s, text="", bg=THEME["bg_status"],
+                                      fg=THEME["ok"], font=self.small_font,
+                                      cursor="hand2")
+            self.st_issues.pack(side="left", padx=(10, 6), pady=2)
+            self.st_issues.bind("<Button-1>", lambda e: self.goto_first_issue())
+            self.st_msg = tk.Label(s, text="", bg=THEME["bg_status"],
+                                   fg=THEME["fg_dim"], font=self.small_font)
+            self.st_msg.pack(side="left", padx=6)
+            for name, cb in (("st_enc", None), ("st_check", self.toggle_autocheck),
+                             ("st_indent", None), ("st_lang", self.language_menu),
+                             ("st_pos", None)):
+                lbl = tk.Label(s, text="", bg=THEME["bg_status"],
+                               fg=THEME["fg_dim"], font=self.small_font,
+                               cursor=("hand2" if cb else "arrow"))
+                lbl.pack(side="right", padx=8, pady=2)
+                if cb:
+                    lbl.bind("<Button-1>", lambda e, f=cb: f())
+                setattr(self, name, lbl)
+            self.st_enc.config(text="UTF-8")
+
+        def _build_menu(self):
+            m = tk.Menu(self)
+
+            def acc(k, shift=False):
+                if IS_MAC:
+                    return ("Shift-Command-%s" if shift else "Command-%s") % k
+                return ("Ctrl+Shift+%s" if shift else "Ctrl+%s") % k
+
+            if IS_MAC:
+                apple = tk.Menu(m, name="apple")
+                apple.add_command(label="About " + APP, command=self.show_about)
+                m.add_cascade(menu=apple)
+            fm = tk.Menu(m, tearoff=0)
+            fm.add_command(label="New File…", accelerator=acc("N"),
+                           command=self.new_file_dialog)
+            fm.add_command(label="Open…", accelerator=acc("O"),
+                           command=self.open_dialog)
+            self.recent_menu = tk.Menu(fm, tearoff=0,
+                                       postcommand=self._fill_recent)
+            fm.add_cascade(label="Open Recent", menu=self.recent_menu)
+            fm.add_separator()
+            fm.add_command(label="Save", accelerator=acc("S"),
+                           command=self.save_active)
+            fm.add_command(label="Save As…", accelerator=acc("S", True),
+                           command=self.save_as_active)
+            fm.add_separator()
+            fm.add_command(label="Close Tab", accelerator=acc("W"),
+                           command=self.close_active)
+            if not IS_MAC:
+                fm.add_separator()
+                fm.add_command(label="Quit", accelerator="Ctrl+Q",
+                               command=self.quit_app)
+            m.add_cascade(label="File", menu=fm)
+
+            em = tk.Menu(m, tearoff=0)
+            em.add_command(label="Undo", accelerator=acc("Z"),
+                           command=lambda: self._ev("<<Undo>>"))
+            em.add_command(label="Redo", accelerator=acc("Z", True),
+                           command=lambda: self._ev("<<Redo>>"))
+            em.add_separator()
+            em.add_command(label="Cut", accelerator=acc("X"),
+                           command=lambda: self._ev("<<Cut>>"))
+            em.add_command(label="Copy", accelerator=acc("C"),
+                           command=lambda: self._ev("<<Copy>>"))
+            em.add_command(label="Paste", accelerator=acc("V"),
+                           command=lambda: self._ev("<<Paste>>"))
+            em.add_command(label="Select All", accelerator=acc("A"),
+                           command=self.select_all)
+            em.add_separator()
+            em.add_command(label="Find & Replace…", accelerator=acc("F"),
+                           command=self.show_findbar)
+            em.add_command(label="Go to Line…", accelerator=acc("L"),
+                           command=self.goto_dialog)
+            em.add_separator()
+            em.add_command(label="Toggle Comment", accelerator=acc("/"),
+                           command=self.toggle_comment)
+            em.add_command(label="Fix All Issues", accelerator=acc("F", True),
+                           command=self.fix_all_active)
+            m.add_cascade(label="Edit", menu=em)
+
+            vm = tk.Menu(m, tearoff=0)
+            vm.add_command(label="Bigger Text", accelerator=acc("+"),
+                           command=lambda: self.zoom(1))
+            vm.add_command(label="Smaller Text", accelerator=acc("-"),
+                           command=lambda: self.zoom(-1))
+            vm.add_command(label="Reset Text Size", accelerator=acc("0"),
+                           command=lambda: self.zoom(0))
+            vm.add_separator()
+            vm.add_command(label="Show/Hide Output", accelerator=acc("J"),
+                           command=lambda: self.output.toggle())
+            vm.add_command(label="Show/Hide Outline", accelerator=acc("B"),
+                           command=self.toggle_outline)
+            vm.add_command(label="Welcome Screen",
+                           command=self.show_home_if_free)
+            m.add_cascade(label="View", menu=vm)
+
+            rm = tk.Menu(m, tearoff=0)
+            rm.add_command(label="Run", accelerator=acc("R"),
+                           command=self.run_active)
+            rm.add_command(label="Debug", accelerator=acc("R", True),
+                           command=lambda: self.run_active(True))
+            rm.add_command(label="Stop", accelerator=acc("."),
+                           command=self.stop_run)
+            rm.add_separator()
+            rm.add_command(label="Clear Output", accelerator=acc("K"),
+                           command=lambda: self.output.clear())
+            m.add_cascade(label="Run", menu=rm)
+
+            tm = tk.Menu(m, tearoff=0)
+            tm.add_checkbutton(label="Auto-check (hints, Tab fixes)",
+                               accelerator=acc("A", True),
+                               variable=self.autocheck_var,
+                               command=self._autocheck_from_menu)
+            self.lang_menu = tk.Menu(tm, tearoff=0,
+                                     postcommand=self._fill_lang_menu)
+            tm.add_cascade(label="Language", menu=self.lang_menu)
+            tm.add_separator()
+            tm.add_command(label="Language Toolchains…",
+                           command=self.show_toolchains)
+            tm.add_command(label="Run Self-Test", command=self.run_selftest)
+            m.add_cascade(label="Tools", menu=tm)
+
+            hm = tk.Menu(m, tearoff=0, name="help" if IS_MAC else None)
+            hm.add_command(label="Keyboard Shortcuts",
+                           command=self.show_shortcuts)
+            if not IS_MAC:
+                hm.add_command(label="About " + APP, command=self.show_about)
+            m.add_cascade(label="Help", menu=hm)
+            self.config(menu=m)
+
+        def _bind_keys(self):
+            mod = "Command" if IS_MAC else "Control"
+
+            def bind(key, fn):
+                self.bind_all("<%s-%s>" % (mod, key),
+                              lambda e, f=fn: self._key(f))
+            bind("n", self.new_file_dialog)
+            bind("o", self.open_dialog)
+            bind("s", self.save_active)
+            bind("S", self.save_as_active)
+            bind("w", self.close_active)
+            bind("q", self.quit_app)
+            bind("r", self.run_active)
+            bind("R", lambda: self.run_active(True))
+            bind("period", self.stop_run)
+            bind("f", self.show_findbar)
+            bind("F", self.fix_all_active)
+            bind("l", self.goto_dialog)
+            bind("slash", self.toggle_comment)
+            bind("j", self.output.toggle)
+            bind("b", self.toggle_outline)
+            bind("k", self.output.clear)
+            bind("a", self.select_all)
+            bind("A", self.toggle_autocheck)
+            bind("equal", lambda: self.zoom(1))
+            bind("plus", lambda: self.zoom(1))
+            bind("minus", lambda: self.zoom(-1))
+            bind("0", lambda: self.zoom(0))
+            self.bind_all("<F5>", lambda e: self._key(self.run_active))
+
+        def _key(self, fn):
+            fn()
+            return "break"
+
+        def _ev(self, seq):
+            w = self.focus_get()
+            if w is not None:
+                try:
+                    w.event_generate(seq)
+                except tk.TclError:
+                    pass
+
+        def _set_icon(self):
+            try:
+                img = tk.PhotoImage(width=32, height=32)
+                img.put(THEME["bg"], to=(0, 0, 32, 32))
+                for y in range(32):
+                    for x in range(32):
+                        if (x - 16) ** 2 + (y - 17) ** 2 <= 180:
+                            img.put(THEME["accent"], (x, y))
+                for y in range(9, 15):
+                    for x in range(19, 25):
+                        if (x - 22) ** 2 + (y - 12) ** 2 <= 7:
+                            img.put("#0c110f", (x, y))
+                self.iconphoto(True, img)
+                self._icon_img = img
+            except Exception:
+                pass
+
+        # ---- settings & recents --------------------------------------------
+
+        def _settings_path(self):
+            return os.path.join(settings_dir(), "settings.json")
+
+        def _load_settings(self):
+            try:
+                with open(self._settings_path(), "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                return d if isinstance(d, dict) else {}
+            except Exception:
+                return {}
+
+        def save_settings(self):
+            self.settings["autocheck"] = self.autocheck
+            self.settings["font_size"] = self.mono_font.cget("size")
+            try:
+                self.settings["geometry"] = self.geometry()
+            except tk.TclError:
+                pass
+            try:
+                with open(self._settings_path(), "w", encoding="utf-8") as f:
+                    json.dump(self.settings, f, indent=2)
+            except OSError:
+                pass
+
+        def add_recent(self, path):
+            r = [p for p in self.settings.get("recent", []) if p != path]
+            r.insert(0, path)
+            self.settings["recent"] = r[:12]
+
+        def _fill_recent(self):
+            self.recent_menu.delete(0, "end")
+            recents = self.settings.get("recent", [])
+            if not recents:
+                self.recent_menu.add_command(label="(empty)", state="disabled")
+                return
+            for p in recents:
+                self.recent_menu.add_command(
+                    label=shorten_home(p),
+                    command=lambda pp=p: self.open_path(pp))
+            self.recent_menu.add_separator()
+            self.recent_menu.add_command(label="Clear Menu",
+                                         command=self._clear_recent)
+
+        def _clear_recent(self):
+            self.settings["recent"] = []
+            if not self._active:
+                self.home.refresh()
+
+        def _fill_lang_menu(self):
+            self.lang_menu.delete(0, "end")
+            tab = self.active_tab()
+            for lid in LANG_ORDER:
+                mark = "◉ " if (tab and tab.lang == lid) else "   "
+                self.lang_menu.add_command(
+                    label=mark + LANGS[lid]["name"],
+                    command=lambda l=lid: self.set_language(l))
+
+        def set_language(self, lang_id):
+            tab = self.active_tab()
+            if tab:
+                tab.set_language(lang_id)
+                self.flash_status("Language: %s" % LANGS[lang_id]["name"])
+
+        def language_menu(self):
+            """Pop up a language chooser from the status bar."""
+            tab = self.active_tab()
+            if not tab:
+                return
+            menu = tk.Menu(self, tearoff=0)
+            for lid in LANG_ORDER:
+                mark = "◉ " if tab.lang == lid else "   "
+                menu.add_command(label=mark + LANGS[lid]["name"],
+                                 command=lambda l=lid: self.set_language(l))
+            try:
+                x = self.st_lang.winfo_rootx()
+                y = self.st_lang.winfo_rooty()
+                menu.tk_popup(x, y - 6)
+            finally:
+                menu.grab_release()
+
+        # ---- tabs ------------------------------------------------------------
+
+        def active_tab(self):
+            return self._active
+
+        def add_tab(self, tab):
+            self.tabs.append(tab)
+            self.activate(tab)
+
+        def activate(self, tab):
+            if self._active is not None and self._active is not tab:
+                self._active.pack_forget()
+            self.home.pack_forget()
+            self._active = tab
+            tab.pack(in_=self.editor_area, fill="both", expand=True)
+            tab.text.focus_set()
+            self.refresh_titles()
+            self.update_status()
+            self.update_issue_ui()
+            self.refresh_outline_if_visible()
+            tab.gutter.schedule()
+
+        def show_home(self):
+            if self._active is not None:
+                self._active.pack_forget()
+                self._active = None
+            self.hide_completion()
+            self.hide_hint()
+            self.home.refresh()
+            self.home.pack(fill="both", expand=True)
+            self.refresh_titles()
+            self.update_status()
+            self.update_issue_ui()
+            self.refresh_outline_if_visible()
+
+        def show_home_if_free(self):
+            if self._active is not None:
+                self._active.pack_forget()
+                self._active = None
+            self.show_home()
+
+        def refresh_titles(self):
+            for w in self.tabrow.winfo_children():
+                w.destroy()
+            for tab in self.tabs:
+                self._tab_button(tab)
+            FlatButton(self.tabrow, " ＋ ", self.new_file_dialog,
+                       font=self.small_font, padx=6, pady=3)\
+                .pack(side="left", padx=(6, 0), pady=4)
+            t = self.active_tab()
+            self.title("%s — %s%s" % (APP, t.title, " •" if t.dirty else "")
+                       if t else APP)
+
+        def _tab_button(self, tab):
+            active = tab is self._active
+            bg = THEME["bg_active"] if active else THEME["bg_panel"]
+            fg = THEME["fg"] if active else THEME["fg_dim"]
+            f = tk.Frame(self.tabrow, bg=bg)
+            f.pack(side="left", padx=(5, 0), pady=(5, 0))
+            name = ("● " if tab.dirty else "") + tab.title
+            lbl = tk.Label(f, text=name, bg=bg, fg=fg, font=self.small_font,
+                           padx=8, pady=3, cursor="hand2")
+            lbl.pack(side="left")
+            x = tk.Label(f, text="✕", bg=bg, fg=THEME["fg_faint"],
+                         font=self.small_font, padx=5, pady=3, cursor="hand2")
+            x.pack(side="left")
+            lbl.bind("<Button-1>", lambda e, tb=tab: self.activate(tb))
+            x.bind("<Button-1>", lambda e, tb=tab: self.close_tab(tb))
+            x.bind("<Enter>", lambda e, w=x: w.configure(fg=THEME["error"]))
+            x.bind("<Leave>", lambda e, w=x: w.configure(fg=THEME["fg_faint"]))
+
+        # ---- file operations ------------------------------------------------
+
+        def new_file_dialog(self):
+            LanguagePicker(self, self.new_file)
+
+        def new_file(self, lang_id):
+            sk = SKELETONS.get(lang_id, "")
+            clean, spans = parse_placeholders(sk)
+            tab = EditorTab(self.editor_area, self, lang=lang_id, content=clean,
+                            placeholders=spans)
+            self.add_tab(tab)
+            self.flash_status("New %s file — %s saves it"
+                              % (LANGS[lang_id]["name"],
+                                 "⌘S" if IS_MAC else "Ctrl+S"))
+
+        def open_dialog(self):
+            path = filedialog.askopenfilename(
+                parent=self,
+                initialdir=self.settings.get("last_dir")
+                or os.path.expanduser("~"))
+            if path:
+                self.open_path(path)
+
+        def open_path(self, path):
+            path = os.path.abspath(path)
+            for tab in self.tabs:
+                if tab.path == path:
+                    self.activate(tab)
+                    return
+            try:
+                with open(path, "rb") as f:
+                    head = f.read(8192)
+                if b"\x00" in head:
+                    messagebox.showwarning(
+                        APP, "That looks like a binary file.\n"
+                             "GeskoIDE edits text files.", parent=self)
+                    return
+                if os.path.getsize(path) > 8000000:
+                    if not messagebox.askyesno(
+                            APP, "This file is quite large - open anyway?",
+                            parent=self):
+                        return
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError as ex:
+                messagebox.showerror(APP, "Could not open the file:\n%s" % ex,
+                                     parent=self)
+                return
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            tab = EditorTab(self.editor_area, self, path=path, content=content)
+            self.add_tab(tab)
+            self.add_recent(path)
+            self.settings["last_dir"] = os.path.dirname(path)
+
+        def save_active(self):
+            tab = self.active_tab()
+            if not tab:
+                return
+            if not tab.path:
+                self.save_as_active()
+                return
+            tab.save_to(tab.path)
+            self.add_recent(tab.path)
+            self.refresh_titles()
+            self.update_status()
+            tab.run_checks(show_hint=False)
+            self.flash_status("Saved " + tab.title)
+
+        def save_as_active(self):
+            tab = self.active_tab()
+            if not tab:
+                return
+            ext = os.path.splitext(tab.title)[1]
+            path = filedialog.asksaveasfilename(
+                parent=self, initialfile=tab.title,
+                defaultextension=ext or "",
+                initialdir=self.settings.get("last_dir")
+                or os.path.expanduser("~"))
+            if not path:
+                return
+            tab.save_to(path)
+            self.add_recent(path)
+            self.settings["last_dir"] = os.path.dirname(path)
+            self.refresh_titles()
+            self.update_status()
+            tab.run_checks(show_hint=False)
+            self.flash_status("Saved " + tab.title)
+
+        def close_active(self):
+            tab = self.active_tab()
+            if tab:
+                self.close_tab(tab)
+            else:
+                self.quit_app()
+
+        def close_tab(self, tab):
+            if tab.dirty:
+                self.activate(tab)
+                ans = messagebox.askyesnocancel(
+                    APP, "Save changes to %s?" % tab.title, parent=self)
+                if ans is None:
+                    return False
+                if ans:
+                    self.save_active()
+                    if tab.dirty:
+                        return False
+            if tab in self.tabs:
+                self.tabs.remove(tab)
+            if self._active is tab:
+                self._active = None
+                tab.destroy()
+                if self.tabs:
+                    self.activate(self.tabs[-1])
+                else:
+                    self.show_home()
+            else:
+                tab.destroy()
+                self.refresh_titles()
+            return True
+
+        def quit_app(self):
+            for tab in list(self.tabs):
+                if tab.dirty:
+                    self.activate(tab)
+                    ans = messagebox.askyesnocancel(
+                        APP, "Save changes to %s before quitting?" % tab.title,
+                        parent=self)
+                    if ans is None:
+                        return
+                    if ans:
+                        self.save_active()
+                        if tab.dirty:
+                            return
+            self.save_settings()
+            if self.runner:
+                self.runner.stop()
+            self.destroy()
+
+        def _mac_open_docs(self, *paths):
+            for p in paths:
+                if os.path.exists(p):
+                    self.open_path(p)
+
+        # ---- status, hints & issues -----------------------------------------
+
+        def flash_status(self, msg):
+            self.st_msg.config(text=msg)
+            if self._flash_job:
+                try:
+                    self.after_cancel(self._flash_job)
+                except Exception:
+                    pass
+            self._flash_job = self.after(
+                3000, lambda: self.st_msg.config(text=""))
+
+        def update_status(self):
+            self.st_check.config(
+                text="Auto-check: %s" % ("on" if self.autocheck else "off"),
+                fg=THEME["accent"] if self.autocheck else THEME["fg_dim"])
+            tab = self.active_tab()
+            if not tab:
+                self.st_pos.config(text="")
+                self.st_lang.config(text="")
+                self.st_indent.config(text="")
+                return
+            ln, col = tab.text.index("insert").split(".")
+            self.st_pos.config(text="Ln %s, Col %d" % (ln, int(col) + 1))
+            sp = LANGS[tab.lang]
+            self.st_lang.config(text=sp["name"], fg=THEME["accent"])
+            self.st_indent.config(
+                text="Tab" if sp["indent_char"] == "\t"
+                else "Spaces: %d" % sp["indent"])
+
+        def update_issue_ui(self):
+            for w in self.hintbar.winfo_children():
+                w.destroy()
+            tab = self.active_tab()
+            if not tab:
+                self.st_issues.config(text="")
+                self.hintbar.grid_remove()
+                return
+            issues = tab.issues
+            if not issues:
+                if getattr(tab, "check_error", None):
+                    self.st_issues.config(text="⚠ auto-check hiccup (see log)",
+                                          fg=THEME["warn"])
+                else:
+                    self.st_issues.config(
+                        text="✓ No problems" if self.autocheck else "",
+                        fg=THEME["ok"])
+                self.hintbar.grid_remove()
+                return
+            errs = sum(1 for i in issues if i.severity == "error")
+            warns = sum(1 for i in issues if i.severity == "warn")
+            infos = len(issues) - errs - warns
+            bits = []
+            for n, word in ((errs, "error"), (warns, "warning"), (infos, "hint")):
+                if n:
+                    bits.append("%d %s%s" % (n, word, "" if n == 1 else "s"))
+            self.st_issues.config(text="⚠ " + " · ".join(bits),
+                                  fg=THEME["error"] if errs else THEME["warn"])
+            for iss in issues[:3]:
+                chip = tk.Frame(self.hintbar, bg=THEME["bg_panel"])
+                chip.pack(side="left", padx=(8, 0), pady=3)
+                tk.Label(chip, text="●", bg=THEME["bg_panel"],
+                         fg=THEME[SEV_COLOR_KEY[iss.severity]],
+                         font=self.small_font).pack(side="left", padx=(4, 2))
+                lbl = tk.Label(chip, text="Ln %d  %s" % (iss.line, iss.msg),
+                               bg=THEME["bg_panel"], fg=THEME["fg_dim"],
+                               font=self.small_font, cursor="hand2")
+                lbl.pack(side="left")
+                lbl.bind("<Button-1>",
+                         lambda e, i=iss, tb=tab: tb.goto_issue(i))
+                if iss.fix:
+                    FlatButton(chip, "Fix",
+                               lambda i=iss, tb=tab: tb.fix_issues([i]),
+                               font=self.small_font, padx=6, pady=0)\
+                        .pack(side="left", padx=(6, 2))
+            if len(issues) > 3:
+                tk.Label(self.hintbar, text="+%d more" % (len(issues) - 3),
+                         bg=THEME["bg_panel"], fg=THEME["fg_faint"],
+                         font=self.small_font).pack(side="left", padx=8)
+            fixable = [i for i in issues if i.fix]
+            if fixable:
+                FlatButton(self.hintbar, "Fix all (%d)" % len(fixable),
+                           tab.fix_all, "primary", font=self.small_font,
+                           padx=8, pady=1).pack(side="right", padx=8, pady=3)
+            self.hintbar.grid()
+
+        def goto_first_issue(self):
+            tab = self.active_tab()
+            if tab and tab.issues:
+                tab.goto_issue(tab.issues[0])
+
+        def toggle_autocheck(self):
+            self.autocheck = not self.autocheck
+            self.autocheck_var.set(self.autocheck)
+            self._after_autocheck_change()
+
+        def _autocheck_from_menu(self):
+            self.autocheck = bool(self.autocheck_var.get())
+            self._after_autocheck_change()
+
+        def _after_autocheck_change(self):
+            if not self.autocheck:
+                self.hide_hint()
+                self.hide_completion()
+            for tab in self.tabs:
+                tab.run_checks(show_hint=False)
+            self.update_status()
+            self.update_issue_ui()
+            self.flash_status("Auto-check %s"
+                              % ("on" if self.autocheck else "off"))
+
+        def select_all(self):
+            tab = self.active_tab()
+            if tab:
+                tab.text.tag_add("sel", "1.0", "end-1c")
+
+        def toggle_comment(self):
+            tab = self.active_tab()
+            if tab:
+                tab.toggle_comment()
+
+        def fix_all_active(self):
+            tab = self.active_tab()
+            if tab:
+                tab.fix_all()
+
+        def zoom(self, d):
+            s = self.mono_font.cget("size")
+            s = max(9, min(30, s + d)) if d else 13
+            for f in (self.mono_font, self.mono_bold, self.mono_italic):
+                f.configure(size=s)
+            for tab in self.tabs:
+                tab.apply_font()
+                tab.gutter.schedule()
+
+        # ---- popups -----------------------------------------------------------
+
+        def _place_popup(self, pop, tab, dy=4):
+            t = tab.text
+            bbox = t.bbox("insert")
+            if not bbox:
+                t.update_idletasks()
+                bbox = t.bbox("insert") or (12, 12, 8, 16)
+            x = t.winfo_rootx() + bbox[0]
+            y = t.winfo_rooty() + bbox[1] + bbox[3] + dy
+            pop.update_idletasks()
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w, h = pop.winfo_reqwidth(), pop.winfo_reqheight()
+            if x + w > sw:
+                x = max(0, sw - w - 8)
+            if y + h > sh:
+                y = t.winfo_rooty() + bbox[1] - h - 4
+            pop.geometry("+%d+%d" % (x, y))
+            pop.lift()
+
+        def show_completion(self, tab, prefix, words):
+            self.hide_completion()
+            self._completion_ctx = (tab, prefix)
+            self.completion_popup = CompletionPopup(self, self, words,
+                                                    self._completion_accept)
+            self._place_popup(self.completion_popup, tab)
+
+        def refill_completion(self, prefix, words):
+            pop = self.completion_popup
+            if pop and pop.winfo_exists() and self._completion_ctx:
+                tab = self._completion_ctx[0]
+                self._completion_ctx = (tab, prefix)
+                pop.fill(words)
+                self._place_popup(pop, tab)
+
+        def accept_completion(self):
+            pop = self.completion_popup
+            if pop and pop.winfo_exists():
+                pop.accept()
+
+        def _completion_accept(self, word):
+            if not self._completion_ctx:
+                return
+            tab, prefix = self._completion_ctx
+            t = tab.text
+            t.delete("insert-%dc" % len(prefix), "insert")
+            t.insert("insert", word)
+            self.hide_completion()
+
+        def hide_completion(self):
+            if self.completion_popup:
+                try:
+                    self.completion_popup.destroy()
+                except tk.TclError:
+                    pass
+            self.completion_popup = None
+            self._completion_ctx = None
+
+        def show_hint(self, tab, issue):
+            key = (issue.line, issue.msg)
+            if (self._hint_key == key and self.hint_popup
+                    and self.hint_popup.winfo_exists()):
+                return
+            self.hide_hint()
+            self._hint_key = key
+
+            def do_fix():
+                tab.fix_issues([issue])
+                self.hide_hint()
+            self.hint_popup = HintPopup(self, self, issue,
+                                        do_fix if issue.fix else None)
+            self._place_popup(self.hint_popup, tab, dy=6)
+            self.after(9000, lambda p=self.hint_popup: self._expire_hint(p))
+
+        def _expire_hint(self, p):
+            if self.hint_popup is p:
+                self.hide_hint()
+
+        def hide_hint(self):
+            if self.hint_popup:
+                try:
+                    self.hint_popup.destroy()
+                except tk.TclError:
+                    pass
+            self.hint_popup = None
+            self._hint_key = None
+
+        def show_findbar(self):
+            if self.active_tab():
+                self.findbar.show()
+
+        def hide_findbar(self):
+            self.findbar.hide()
+
+        def toggle_outline(self):
+            if self.active_tab():
+                self.outline.toggle()
+            else:
+                self.flash_status("Open a file first")
+
+        def refresh_outline_if_visible(self):
+            if getattr(self, "outline", None) and self.outline.visible:
+                self.outline.refresh()
+
+        # ---- running ----------------------------------------------------------
+
+        def run_active(self, debug=False):
+            tab = self.active_tab()
+            if not tab:
+                self.flash_status("Create or open a file first")
+                return
+            self.stop_run()
+            self.hide_completion()
+            self.hide_hint()
+            if tab.path:
+                tab.save_to(tab.path)
+                self.refresh_titles()
+                path = tab.path
+            else:
+                d = os.path.join(settings_dir(), "scratch")
+                try:
+                    os.makedirs(d, exist_ok=True)
+                except OSError:
+                    d = tempfile.gettempdir()
+                path = os.path.join(d, tab.title)
+                txt = tab.get_text()
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(txt if (not txt or txt.endswith("\n"))
+                            else txt + "\n")
+            if tab.lang == "json":
+                self.output.begin_static("Validate " + tab.title)
+                try:
+                    obj = json.loads(tab.get_text() or "null")
+                    pretty = json.dumps(obj, indent=2, ensure_ascii=False)
+                    self.output.append("out", pretty[:20000] + "\n")
+                    self.output.append("ok", "Valid JSON\n")
+                except json.JSONDecodeError as ex:
+                    self.output.append("err", "Invalid JSON: %s\n" % ex)
+                return
+            if tab.lang == "markdown":
+                html = markdown_to_html(tab.get_text(), tab.title)
+                out = os.path.join(tempfile.gettempdir(),
+                                   "geskoide-preview.html")
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(html)
+                webbrowser.open("file://" + out)
+                self.output.begin_static("Preview " + tab.title)
+                self.output.append("info", "Preview opened in your browser "
+                                           "(rendered locally, offline).\n")
+                return
+            kind, val = build_steps(tab.lang, path, debug=debug)
+            if kind == "info":
+                self.output.begin_static("Run " + tab.title)
+                self.output.append("info", val + "\n")
+                return
+            if kind == "open":
+                webbrowser.open("file://" + val)
+                self.output.begin_static("Preview " + tab.title)
+                self.output.append("info", "Opened in your default browser "
+                                           "(local file, no internet).\n")
+                return
+            self.runner = StepRunner(val, cwd=os.path.dirname(path) or None)
+            self.output.begin_run(tab.title, debug)
+            self.runner.start()
+            self.output.poll(self.runner)
+
+        def stop_run(self):
+            if self.runner:
+                self.runner.stop()
+
+        def run_selftest(self):
+            self.stop_run()
+            me = os.path.abspath(__file__)
+            self.runner = StepRunner(
+                [{"argv": [sys.executable or "python3", me, "--selftest"],
+                  "label": "GeskoIDE self-test"}])
+            self.output.begin_run("self-test", False)
+            self.runner.start()
+            self.output.poll(self.runner)
+
+        # ---- dialogs ----------------------------------------------------------
+
+        def _center_child(self, win, w, h):
+            try:
+                self.update_idletasks()
+                x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
+                y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 3)
+                win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+            except tk.TclError:
+                pass
+
+        def goto_dialog(self):
+            tab = self.active_tab()
+            if not tab:
+                return
+            win = tk.Toplevel(self)
+            win.title("Go to Line")
+            win.configure(bg=THEME["bg_panel"], padx=16, pady=14)
+            win.transient(self)
+            win.resizable(False, False)
+            tk.Label(win, text="Jump to line:", bg=THEME["bg_panel"],
+                     fg=THEME["fg"], font=self.ui_font).pack(anchor="w")
+            e = tk.Entry(win, bg=THEME["bg_input"], fg=THEME["fg"],
+                         insertbackground=THEME["caret"], bd=0,
+                         highlightthickness=1, width=12,
+                         highlightbackground=THEME["border"],
+                         highlightcolor=THEME["accent_dark"],
+                         font=self.mono_font)
+            e.pack(pady=9, fill="x")
+
+            def go(ev=None):
+                raw = e.get().strip()
+                win.destroy()
+                if raw.isdigit():
+                    tab.goto_line(int(raw))
+            e.bind("<Return>", go)
+            e.bind("<Escape>", lambda ev: win.destroy())
+            FlatButton(win, "Go", go, "primary",
+                       font=self.small_font).pack(anchor="e")
+            self._center_child(win, 250, 128)
+            e.focus_set()
+            try:
+                win.grab_set()
+            except tk.TclError:
+                pass
+
+        def show_toolchains(self):
+            """Show which languages can Run / Debug with the tools present."""
+            win = tk.Toplevel(self)
+            win.title("Language Toolchains")
+            win.configure(bg=THEME["bg_panel"], padx=18, pady=14)
+            win.transient(self)
+            tk.Label(win, text="What can run on this computer, right now",
+                     bg=THEME["bg_panel"], fg=THEME["fg"],
+                     font=self.ui_font).pack(anchor="w")
+            tk.Label(win, text="GeskoIDE uses the tools already installed — "
+                               "nothing is downloaded, no internet is used.",
+                     bg=THEME["bg_panel"], fg=THEME["fg_dim"],
+                     font=self.small_font).pack(anchor="w", pady=(0, 8))
+            wrap = tk.Frame(win, bg=THEME["bg_panel"])
+            wrap.pack(fill="both", expand=True)
+            canvas = tk.Canvas(wrap, bg=THEME["bg_panel"], highlightthickness=0,
+                               width=600, height=420)
+            sb = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+            inner = tk.Frame(canvas, bg=THEME["bg_panel"])
+            canvas.configure(yscrollcommand=sb.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            cw = canvas.create_window((0, 0), window=inner, anchor="nw")
+            inner.bind("<Configure>", lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")))
+            canvas.bind("<Configure>",
+                        lambda e: canvas.itemconfigure(cw, width=e.width))
+            hdr = tk.Frame(inner, bg=THEME["bg_panel"])
+            hdr.pack(fill="x", pady=(0, 2))
+            for txt, w in (("Language", 15), ("Run", 6), ("Debug", 7),
+                           ("Tool / how to enable", 30)):
+                tk.Label(hdr, text=txt, width=w, anchor="w",
+                         bg=THEME["bg_panel"], fg=THEME["fg_faint"],
+                         font=self.small_font).pack(side="left")
+            for lid in LANG_ORDER:
+                kind, val = build_steps(lid, "x" + LANGS[lid]["exts"][0])
+                dbg_kind, _ = build_steps(lid, "x" + LANGS[lid]["exts"][0],
+                                          debug=True)
+                runnable = kind in ("steps", "open")
+                if lid in ("css", "yaml", "text"):
+                    run_mark, note = "—", "editing only"
+                elif lid == "json":
+                    run_mark, note, runnable = "✓", "validate (built in)", True
+                elif lid == "markdown":
+                    run_mark, note, runnable = "✓", "HTML preview (built in)", \
+                        True
+                elif runnable:
+                    tool = ""
+                    if kind == "steps":
+                        tool = os.path.basename(val[0]["argv"][0])
+                    run_mark, note = "✓", (tool or "browser preview")
+                else:
+                    run_mark = "✗"
+                    note = re.split(r"[.\n]", val)[0] if isinstance(val, str) \
+                        else "needs its tool"
+                dbg_mark = "✓" if (kind == "steps"
+                                   and dbg_kind == "steps") else "—"
+                row = tk.Frame(inner, bg=THEME["bg_panel"])
+                row.pack(fill="x")
+                tk.Label(row, text=LANGS[lid]["name"], width=15, anchor="w",
+                         bg=THEME["bg_panel"], fg=THEME["fg"],
+                         font=self.small_font).pack(side="left")
+                tk.Label(row, text=run_mark, width=6, anchor="w",
+                         bg=THEME["bg_panel"],
+                         fg=THEME["ok"] if run_mark == "✓" else THEME["fg_faint"],
+                         font=self.small_font).pack(side="left")
+                tk.Label(row, text=dbg_mark, width=7, anchor="w",
+                         bg=THEME["bg_panel"],
+                         fg=THEME["ok"] if dbg_mark == "✓" else THEME["fg_faint"],
+                         font=self.small_font).pack(side="left")
+                tk.Label(row, text=note[:44], anchor="w", bg=THEME["bg_panel"],
+                         fg=THEME["fg_dim"], font=self.small_font).pack(
+                    side="left", fill="x")
+            FlatButton(win, "Close", win.destroy, "primary",
+                       font=self.small_font).pack(anchor="e", pady=(10, 0))
+            win.bind("<Escape>", lambda e: win.destroy())
+            self._center_child(win, 640, 560)
+
+        def show_shortcuts(self):
+            win = tk.Toplevel(self)
+            win.title("Keyboard Shortcuts")
+            win.configure(bg=THEME["bg_panel"], padx=20, pady=16)
+            win.transient(self)
+            win.resizable(False, False)
+            mod = "⌘" if IS_MAC else "Ctrl+"
+            rows = [
+                ("New file", mod + "N"),
+                ("Open file", mod + "O"),
+                ("Save  /  Save As", "%sS  /  ⇧%sS" % (mod, mod)),
+                ("Close tab", mod + "W"),
+                ("Run  /  Debug  /  Stop", "%sR  /  ⇧%sR  /  %s." % (mod, mod, mod)),
+                ("Complete · fix · next placeholder", "Tab"),
+                ("Un-indent", "⇧Tab"),
+                ("Find & replace", mod + "F"),
+                ("Fix all issues", "⇧" + mod + "F"),
+                ("Show/hide outline", mod + "B"),
+                ("Go to line", mod + "L"),
+                ("Toggle comment", mod + "/"),
+                ("Show/hide output", mod + "J"),
+                ("Clear output", mod + "K"),
+                ("Bigger / smaller text", "%s+  /  %s-" % (mod, mod)),
+                ("Auto-check on/off", "⇧" + mod + "A"),
+                ("Dismiss popups / placeholders", "Esc"),
+            ]
+            for a, b in rows:
+                r = tk.Frame(win, bg=THEME["bg_panel"])
+                r.pack(fill="x", pady=1)
+                tk.Label(r, text=b, width=16, anchor="w", bg=THEME["bg_panel"],
+                         fg=THEME["accent"], font=self.small_font)\
+                    .pack(side="left")
+                tk.Label(r, text=a, anchor="w", bg=THEME["bg_panel"],
+                         fg=THEME["fg"], font=self.small_font)\
+                    .pack(side="left")
+            FlatButton(win, "Close", win.destroy,
+                       font=self.small_font).pack(anchor="e", pady=(12, 0))
+            win.bind("<Escape>", lambda e: win.destroy())
+            self._center_child(win, 430, 470)
+
+        def show_about(self):
+            win = tk.Toplevel(self)
+            win.title("About " + APP)
+            win.configure(bg=THEME["bg"], padx=24, pady=18)
+            win.transient(self)
+            win.resizable(False, False)
+            tk.Label(win, text=APP, bg=THEME["bg"], fg=THEME["fg"],
+                     font=self.ui_big).pack()
+            for line in ("Version %s" % VERSION,
+                         "A fast, friendly code editor in a single file.",
+                         "",
+                         "100% offline: no accounts, no APIs, no telemetry.",
+                         "Runs code with the tools already on this computer.",
+                         "The “Gecko Dark” theme is original to GeskoIDE.",
+                         "",
+                         "Apache License 2.0"):
+                tk.Label(win, text=line, bg=THEME["bg"],
+                         fg=THEME["fg_dim"] if line else THEME["bg"],
+                         font=self.small_font).pack()
+            FlatButton(win, "Nice", win.destroy, "primary",
+                       font=self.small_font).pack(pady=(12, 0))
+            win.bind("<Escape>", lambda e: win.destroy())
+            self._center_child(win, 380, 300)
+
+    class LanguagePicker(tk.Toplevel):
+        """'New File' dialog: pick a language, get a friendly skeleton."""
+
+        def __init__(self, app, callback):
+            super().__init__(app)
+            self.app = app
+            self.callback = callback
+            self.items = []
+            self.title("New File")
+            self.configure(bg=THEME["bg_panel"], padx=16, pady=14)
+            self.transient(app)
+            self.resizable(False, False)
+            tk.Label(self, text="What are you writing today?",
+                     bg=THEME["bg_panel"], fg=THEME["fg"],
+                     font=app.ui_font).pack(anchor="w")
+            self.entry = tk.Entry(self, bg=THEME["bg_input"], fg=THEME["fg"],
+                                  insertbackground=THEME["caret"], bd=0,
+                                  highlightthickness=1, width=30,
+                                  highlightbackground=THEME["border"],
+                                  highlightcolor=THEME["accent_dark"],
+                                  font=app.ui_font)
+            self.entry.pack(fill="x", pady=(9, 7))
+            self.lb = tk.Listbox(self, bg=THEME["bg_input"], fg=THEME["fg"],
+                                 selectbackground=THEME["accent_dark"],
+                                 selectforeground="#eafff2",
+                                 highlightthickness=0, bd=0,
+                                 activestyle="none", font=app.ui_font,
+                                 height=13)
+            self.lb.pack(fill="both", expand=True)
+            tk.Label(self, text="New files start from a clean skeleton —\n"
+                                "placeholders selected, Tab hops to the next one.",
+                     bg=THEME["bg_panel"], fg=THEME["fg_faint"],
+                     font=app.small_font, justify="left")\
+                .pack(anchor="w", pady=(8, 0))
+            self.entry.bind("<KeyRelease>", self._filter)
+            self.entry.bind("<Return>", self._choose)
+            self.entry.bind("<Escape>", lambda e: self.destroy())
+            self.entry.bind("<Down>", lambda e: self._move(1))
+            self.entry.bind("<Up>", lambda e: self._move(-1))
+            self.lb.bind("<Double-Button-1>", self._choose)
+            self.lb.bind("<Return>", self._choose)
+            self.lb.bind("<Escape>", lambda e: self.destroy())
+            self._filter()
+            app._center_child(self, 360, 430)
+            self.entry.focus_set()
+            try:
+                self.grab_set()
+            except tk.TclError:
+                pass
+
+        def _filter(self, ev=None):
+            if ev and ev.keysym in ("Return", "Up", "Down", "Escape"):
+                return
+            q = self.entry.get().strip().lower()
+            self.items = []
+            self.lb.delete(0, "end")
+            for lid in LANG_ORDER:
+                nm = LANGS[lid]["name"]
+                if not q or q in nm.lower() or q in lid:
+                    self.items.append(lid)
+                    exts = LANGS[lid]["exts"]
+                    self.lb.insert("end", "  %s   %s"
+                                   % (nm, exts[0] if exts else ""))
+            if self.items:
+                self.lb.selection_set(0)
+
+        def _move(self, d):
+            cur = self.lb.curselection()
+            i = max(0, min(self.lb.size() - 1, (cur[0] if cur else 0) + d))
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(i)
+            self.lb.see(i)
+            return "break"
+
+        def _choose(self, ev=None):
+            cur = self.lb.curselection()
+            if not cur or not self.items:
+                self.destroy()
+                return
+            lid = self.items[cur[0]]
+            self.destroy()
+            self.callback(lid)
+
+
+def shorten_home(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+
+# --------------------------------------------------------------------------
+# Self-test (runs without a display: pure logic + a real subprocess).
+# --------------------------------------------------------------------------
+
+def selftest():
+    print("%s %s self-test (python %s)" % (APP, VERSION,
+                                           sys.version.split()[0]))
+    failures = []
+    total = [0]
+
+    def run(name, fn):
+        total[0] += 1
+        try:
+            fn()
+            print("  ok   %s" % name)
+        except AssertionError as ex:
+            failures.append(name)
+            print("  FAIL %s%s" % (name, (" - %s" % ex) if str(ex) else ""))
+        except Exception as ex:  # noqa
+            failures.append(name)
+            print("  FAIL %s - %r" % (name, ex))
+
+    def t_polyglot():
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
+            first = f.readline()
+        assert first.startswith("#!/bin/sh"), first
+
+    def t_lexers():
+        for lid in LANGS:
+            toks = tokenize("test 123 abc", lid)
+            assert toks, lid
+
+    def t_python_tokens():
+        src = 'def foo(x):\n    return x + 1  # done\ns = "hi"\n'
+        toks = tokenize(src, "python")
+        types = {src[s:e]: tt for s, e, tt in toks}
+        assert types["def"] == "keyword"
+        assert types["foo"] == "func"
+        assert types['"hi"'] == "string"
+        assert types["# done"] == "comment"
+        assert types["1"] == "number"
+        assert types["return"] == "keyword"
+
+    def t_every_word_colored():
+        src = "alpha = beta(gamma) + Delta # words\n"
+        toks = tokenize(src, "python")
+        for m in WORD_RE.finditer(src):
+            assert any(s <= m.start() and m.end() <= e
+                       for s, e, _ in toks), m.group(0)
+
+    def t_rainbow():
+        src = "f([x])"
+        toks = tokenize(src, "python")
+        retype, unclosed, stray, _ = scan_brackets(src, toks)
+        assert not unclosed and not stray
+        depths = sorted(set(retype.values()))
+        assert depths == ["brk0", "brk1"], depths
+
+    def t_lineindex():
+        li = LineIndex("ab\ncd\n")
+        assert li.line_col(0) == (1, 0)
+        assert li.line_col(3) == (2, 0)
+        assert li.tk(4) == "2.1"
+
+    def t_detect():
+        assert detect_language("x.py") == "python"
+        assert detect_language("x.command") == "shell"
+        assert detect_language(None, "#!/usr/bin/env node") == "javascript"
+        assert detect_language("x.geskoext", '{"a": 1}') == "json"
+
+    def t_outline_items():
+        py = "class App:\n    def run(self):\n        pass\n\ndef main():\n    pass\n"
+        got = outline_items(py, "python")
+        assert [(i.line, i.kind, i.name) for i in got] == [
+            (1, "class", "App"), (2, "def", "run"), (5, "def", "main")
+        ], got
+        md = outline_items("# Title\n\n## Part\n", "markdown")
+        assert [i.name for i in md] == ["Title", "Part"], md
+
+    def t_missing_colon():
+        issues = check_source("if x\n", "python")
+        colon = [i for i in issues if i.fix and i.fix[0] == "colon"]
+        assert colon, issues
+        fixed = fixed_line_text("if x", colon[0], LANGS["python"])
+        assert fixed == "if x:", fixed
+
+    def t_no_false_colon():
+        for src in ("if x: y()\n", "x = {1: 2}\n", "for i in r:  # c\n    pass\n",
+                    "def f(\n    a,\n):\n    pass\n"):
+            issues = check_source(src, "python")
+            assert not any(i.fix and i.fix[0] == "colon" for i in issues), src
+
+    def t_unclosed_paren():
+        issues = check_source('print("hi"\n', "python")
+        close = [i for i in issues if i.fix and i.fix[0] == "close_line"]
+        assert close, issues
+        fixed = fixed_line_text('print("hi"', close[0], LANGS["python"])
+        assert fixed == 'print("hi")', fixed
+
+    def t_unclosed_string():
+        issues = check_source('x = "abc\n', "python")
+        cs = [i for i in issues if i.fix and i.fix[0] == "close_string"]
+        assert cs, issues
+        fixed = fixed_line_text('x = "abc', cs[0], LANGS["python"])
+        assert fixed == 'x = "abc"', fixed
+
+    def t_triple_unclosed():
+        issues = check_source('"""doc\nmore\n', "python")
+        assert any(i.fix and i.fix[0] == "append_eof" for i in issues), issues
+
+    def t_stray_close():
+        issues = check_source("foo)\n", "python")
+        assert any("Unexpected" in i.msg for i in issues), issues
+
+    def t_print_py2():
+        issues = check_source("print x\n", "python")
+        pc = [i for i in issues if i.fix and i.fix[0] == "print_call"]
+        assert pc, issues
+        fixed = fixed_line_text("print x", pc[0], LANGS["python"])
+        assert fixed == "print(x)", fixed
+        # A string argument must still be detected (regression: the string
+        # was being masked to blanks before the check could see it).
+        s_issues = check_source('print "hi"\n', "python")
+        sp_ = [i for i in s_issues if i.fix and i.fix[0] == "print_call"]
+        assert sp_, s_issues
+        assert fixed_line_text('print "hi"', sp_[0],
+                               LANGS["python"]) == 'print("hi")'
+        # Valid Python 3 must NOT be flagged.
+        for good in ('print("hi")\n', "print()\n", "print = 5\n"):
+            g = check_source(good, "python")
+            assert not any(i.fix and i.fix[0] == "print_call" for i in g), good
+
+    def t_eq_cond():
+        src = "if (a = b) {\n}\n"
+        issues = check_source(src, "c")
+        eq = [i for i in issues if i.fix and i.fix[0] == "eq_cond"]
+        assert eq, issues
+        fixed = fixed_line_text("if (a = b) {", eq[0], LANGS["c"])
+        assert fixed == "if (a == b) {", fixed
+
+    def t_semicolon():
+        src = "int main(void) {\n    int x = 1\n    return 0;\n}\n"
+        issues = check_source(src, "c")
+        semi = [i for i in issues if i.fix and i.fix[0] == "semicolon"]
+        assert semi and semi[0].line == 2, issues
+        fixed = fixed_line_text("    int x = 1", semi[0], LANGS["c"])
+        assert fixed == "    int x = 1;", fixed
+
+    def t_json_check():
+        issues = check_source('{"a": 1,}', "json")
+        assert any(i.severity == "error" for i in issues), issues
+        assert not check_source('{"a": 1}', "json")
+
+    def t_java_rename():
+        issues = check_source("public class Bar {\n}\n", "java", "Foo.java")
+        rn = [i for i in issues if i.fix and i.fix[0] == "rename_class"]
+        assert rn and rn[0].fix[1] == "Foo", issues
+
+    def t_compile_hint():
+        issues = check_source("def f(:\n", "python")
+        assert any(i.severity == "error" for i in issues), issues
+
+    def t_py_undefined():
+        m = [i.msg for i in check_source("import os\nprint(oss)\n", "python")]
+        assert any("'oss' is not defined" in x for x in m), m
+        assert any("'os' is imported but never used" in x for x in m), m
+
+    def t_py_no_false_positives():
+        # A spread of valid constructs must produce zero name/import warnings.
+        valid = [
+            "def f(a, b=1):\n    return a + b\n",
+            "xs = [i for i in range(3)]\nprint(xs)\n",
+            "class A:\n    def __init__(s):\n        s.x = 1\n",
+            "try:\n    pass\nexcept ValueError as e:\n    print(e)\n",
+            "with open('f') as fh:\n    print(fh)\n",
+            "if (z := 5) > 1:\n    print(z)\n",
+            "for k, v in {}.items():\n    print(k, v)\n",
+            "from os import *\nprint(getcwd())\n",   # star import -> skip
+            "g = lambda q: q + 1\nprint(g(2))\n",
+        ]
+        for s in valid:
+            bad = [i.msg for i in check_source(s, "python")
+                   if "not defined" in i.msg or "never used" in i.msg]
+            assert not bad, (s, bad)
+
+    def t_parse_diagnostics():
+        # clang / gcc / gofmt / luac style
+        d = parse_diagnostics("gcc", "t.c:3:14: error: expected ';' after\n"
+                                     "t.c:5:2: warning: unused variable 'x'\n"
+                                     "t.c:1:1: note: ignore me\n")
+        assert (3, 13, "error") == d[0][:3], d
+        assert d[0][4] == ("semicolon", None), d
+        assert d[1][2] == "warn" and len(d) == 2, d
+        # node --check
+        dn = parse_diagnostics("node", "/x/a.js:2\n\nSyntaxError: bad thing\n")
+        assert dn and dn[0][0] == 2 and "SyntaxError" in dn[0][3], dn
+        # bash -n
+        db = parse_diagnostics("bash", "a.sh: line 4: syntax error: eof\n")
+        assert db and db[0][0] == 4, db
+        # ruby / perl / php / tsc
+        assert parse_diagnostics("ruby", "a.rb:3: syntax error (SyntaxError)\n")[0][0] == 3
+        assert parse_diagnostics("perl", "boom at a.pl line 7, near x\n")[0][0] == 7
+        assert parse_diagnostics(
+            "php", "PHP Parse error:  syntax error, x in a.php on line 9\n")[0][0] == 9
+        assert parse_diagnostics(
+            "tsc", "a.ts(2,5): error TS2322: nope\n")[0][:2] == (2, 4)
+
+    def t_linter_registry():
+        # Every registered linter builds a sane argv and points at real langs.
+        for lang, spec in EXTERNAL_LINTERS.items():
+            assert lang in LANGS, lang
+            argv = spec["args"](spec["tools"][0], "/tmp/x")
+            assert isinstance(argv, list) and argv[0] == spec["tools"][0], lang
+        assert _java_stem("public class Foo {}") == "Foo.java"
+        assert _java_stem("int x;") == "Main.java"
+
+    def t_split_comment():
+        code, comment = split_code_comment('x = "#no"  # yes', "#")
+        assert code == 'x = "#no"  ' and comment == "# yes", (code, comment)
+
+    def t_completions():
+        text = "apple banana apricot appliance apple\n"
+        out = collect_completions(text, "ap", "python")
+        assert out and out[0] == "apple", out
+        assert "apricot" in out and "banana" not in out
+
+    def t_compute_completions():
+        # Word completion via the unified entry point.
+        out = compute_completions("printed = 1\npri", "pri", "python")
+        assert "print" in out, out
+        # Python member completion by live stdlib introspection (offline).
+        mem = compute_completions("import math\nx = math.sq", "x = math.sq",
+                                  "python")
+        assert "sqrt" in mem, mem
+        assert all(m.startswith("sq") for m in mem), mem
+        # Aliased import resolves.
+        al = compute_completions("import os.path as p\np.jo", "p.jo", "python")
+        assert "join" in al, al
+        # Non-stdlib modules are never imported (safety).
+        assert python_member_completions("import numpy as np\n", "np",
+                                         "ar") is None
+
+    def t_debuggers():
+        # Debug must produce a debugger step for the common toolchains.
+        for lang, needle in (("python", "pdb"),):
+            k, steps = build_steps(lang, "/tmp/x" + LANGS[lang]["exts"][0],
+                                   debug=True)
+            assert k == "steps", (lang, k)
+            assert any(needle in s.get("label", "") + " ".join(s["argv"])
+                       for s in steps), (lang, steps)
+        # Running must never crash for any language (returns a valid shape).
+        for lid in LANG_ORDER:
+            kind, _ = build_steps(lid, "/tmp/x" + LANGS[lid]["exts"][0])
+            assert kind in ("steps", "info", "open"), (lid, kind)
+
+    def t_placeholders():
+        clean, spans = parse_placeholders("for «item» in «»:")
+        assert clean == "for item in :", repr(clean)
+        assert spans == [(4, 8), (12, 12)], spans
+
+    def t_skeletons():
+        missing = [l for l in LANG_ORDER if l not in SKELETONS]
+        assert not missing, missing
+        for lid, sk in SKELETONS.items():
+            clean, _ = parse_placeholders(sk)
+            assert "«" not in clean and "»" not in clean, lid
+
+    def t_snippets():
+        for fam, table in SNIPPETS.items():
+            for k, v in table.items():
+                clean, _ = parse_placeholders(v)
+                assert "«" not in clean, (fam, k)
+
+    def t_build_steps():
+        kind, steps = build_steps("python", "/tmp/x.py")
+        assert kind == "steps" and steps[0]["argv"][0] == sys.executable
+        kind2, _ = build_steps("css", "/tmp/x.css")
+        assert kind2 == "info"
+        kind3, val3 = build_steps("html", "/tmp/x.html")
+        assert kind3 == "open" and val3 == "/tmp/x.html"
+
+    def t_markdown_html():
+        html = markdown_to_html("# T\n\n- a\n\n`c`\n")
+        assert "<h1>T</h1>" in html and "<li>a</li>" in html
+        assert "<code>c</code>" in html
+
+    def t_runner():
+        r = StepRunner([{"argv": [sys.executable, "-c", "print(6*7)"]}])
+        r.start()
+        out, rc = [], None
+        t0 = time.time()
+        while time.time() - t0 < 30:
+            try:
+                ev = r.events.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            if ev[0] == "done":
+                rc = ev[1]
+                break
+            if ev[0] == "out":
+                out.append(ev[1])
+        assert rc == 0, rc
+        assert "42" in "".join(out), out
+
+    def t_depths():
+        src = "f(\n  1,\n)\nx = 1\n"
+        toks = tokenize(src, "python")
+        li = LineIndex(src)
+        _, _, _, events = scan_brackets(src, toks)
+        d = depth_at_line_starts(li.starts, events)
+        assert d[0] == 0 and d[1] == 1 and d[3] == 0, d
+
+    run("polyglot header intact", t_polyglot)
+    run("all %d language lexers work" % len(LANGS), t_lexers)
+    run("python tokens classified", t_python_tokens)
+    run("every word gets a color", t_every_word_colored)
+    run("rainbow bracket depths", t_rainbow)
+    run("line index math", t_lineindex)
+    run("language detection", t_detect)
+    run("outline extraction", t_outline_items)
+    run("missing ':' detected + fixed", t_missing_colon)
+    run("no false ':' positives", t_no_false_colon)
+    run("unclosed '(' detected + fixed", t_unclosed_paren)
+    run("unclosed string detected + fixed", t_unclosed_string)
+    run("unclosed triple-quote detected", t_triple_unclosed)
+    run("stray ')' detected", t_stray_close)
+    run("python-2 print detected + fixed", t_print_py2)
+    run("'=' in condition detected + fixed", t_eq_cond)
+    run("missing ';' detected + fixed", t_semicolon)
+    run("json validation", t_json_check)
+    run("java class/file mismatch", t_java_rename)
+    run("python syntax errors surfaced", t_compile_hint)
+    run("python undefined name + unused import", t_py_undefined)
+    run("python analysis: no false positives", t_py_no_false_positives)
+    run("compiler diagnostic parsers", t_parse_diagnostics)
+    run("external linter registry", t_linter_registry)
+    run("comment splitting respects strings", t_split_comment)
+    run("completion ranking", t_completions)
+    run("completion: words + python member introspection", t_compute_completions)
+    run("run/debug steps for every language", t_debuggers)
+    run("placeholder parsing", t_placeholders)
+    run("skeletons for every language", t_skeletons)
+    run("snippets are well-formed", t_snippets)
+    run("run steps (python/css/html)", t_build_steps)
+    run("markdown preview renderer", t_markdown_html)
+    run("subprocess runner end-to-end", t_runner)
+    run("bracket depth per line", t_depths)
+
+    print("-" * 46)
+    if failures:
+        print("FAILED: %d of %d tests" % (len(failures), total[0]))
+        return 1
+    print("All %d tests passed. GeskoIDE is ready." % total[0])
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+def main(argv):
+    if "--version" in argv:
+        print("%s %s" % (APP, VERSION))
+        return 0
+    if "--help" in argv or "-h" in argv:
+        print(
+            "%s %s - a fast, friendly, fully offline code editor.\n\n"
+            "Usage:\n"
+            "  GeskoIDE.command [files...]   open files (or the welcome screen)\n"
+            "  GeskoIDE.command --selftest   run the built-in test suite\n"
+            "  GeskoIDE.command --version    print the version\n"
+            "  GeskoIDE.command --help       show this help\n\n"
+            "No internet, no accounts, no APIs. Knows %d languages, colors "
+            "every token,\nauto-completes and auto-fixes on Tab, and runs your "
+            "code with the tools\nalready on your computer."
+            % (APP, VERSION, len(LANGS)))
+        return 0
+    if "--selftest" in argv:
+        return selftest()
+    files = [a for a in argv if not a.startswith("-")]
+    if not TK_OK:
+        sys.stderr.write(
+            "GeskoIDE needs Python's Tk support (tkinter), which was not "
+            "found.\n"
+            "  macOS:          install Python 3 from python.org (includes "
+            "Tk),\n"
+            "                  or run:  xcode-select --install\n"
+            "  Debian/Ubuntu:  sudo apt install python3-tk\n"
+            "  Fedora:         sudo dnf install python3-tkinter\n")
+        return 1
+    try:
+        app = GeskoApp(files)
+    except tk.TclError as ex:
+        sys.stderr.write(
+            "GeskoIDE could not open a window (%s).\n"
+            "It needs a graphical session - on a headless/SSH machine, "
+            "run it on the desktop instead.\n" % ex)
+        return 1
+    app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
