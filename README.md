@@ -32,6 +32,19 @@ The macOS `.command` edition contains the full Python/Tkinter desktop IDE, a hov
 python3 GeskoIDE.command --selftest
 ```
 
+## Fix Everything (GeckoFix deep repair engine)
+
+Version 2.0 adds a deep repair engine — press **⇧⌘F** (or the *Fix all* button) and GeskoIDE repairs the whole file in iterative passes, entirely offline:
+
+- **Python**: drives the real parser error-by-error — missing `:` and `,`, `'='` vs `'=='`, indentation problems (expected block / unexpected indent / unindent mismatch), unclosed strings and brackets, Python-2 `print` — then, once it parses, fixes **typos by fuzzy rename** (`maths.pi` → `math.pi`), **auto-imports** stdlib modules you used, and removes unused imports.
+- **C / C++**: compiles with clang/gcc `-fdiagnostics-parseable-fixits` and applies the compiler's own machine-readable repairs (missing `;`, `vectr` → `vector`, `.` vs `->`, …) in a loop until clean.
+- **Everything**: curly “smart quotes” and full-width ；：，punctuation from web pastes are normalized (valid string contents are left alone), and layout is fixed — indentation snapped to the language grid, trailing whitespace stripped.
+- **Format Document** (**⇧⌘L**) formats with `gofmt` / `rustfmt` / `clang-format` when installed, else the built-in reindenter.
+
+Each run prints an itemized *Fix report* in the output console and ends with how many errors remain (usually zero):
+
+![Fix Everything repairing an 8-error file with an itemized report](docs/fixreport.png)
+
 ## Build the APK
 
 The APK can be rebuilt on a Mac with Android Studio installed:

@@ -40,7 +40,7 @@ from bisect import bisect_right
 from collections import Counter, namedtuple
 
 APP = "GeskoIDE"
-VERSION = "1.3.0"
+VERSION = "2.0.0"
 IS_MAC = (sys.platform == "darwin")
 IS_WIN = (sys.platform == "win32")
 
@@ -1554,6 +1554,722 @@ def outline_items(text, lang_id, limit=600):
     return out
 
 
+# ==========================================================================
+# GeckoFix - the deep repair engine.
+#
+# "Fix Everything" runs repair ROUNDS until the file is clean or stable:
+#   round = normalize unicode punctuation  (curly quotes, full-width ; : ,)
+#         + apply every fixable issue from the fast checker
+#         + language-specific repair:
+#             Python : drive the real parser - each SyntaxError message is
+#                      dispatched to a targeted repair (colons, commas,
+#                      '=' vs '==', indentation, strings, print, ...); once
+#                      it parses, semantic repairs run (typo renames via
+#                      fuzzy match, auto-import of stdlib modules, unused-
+#                      import removal).
+#             C/C++  : compile with clang/gcc "-fdiagnostics-parseable-
+#                      fixits" and apply the compiler's own machine-readable
+#                      edits (missing ';', typo suggestions, '.'->'->', ...).
+#             others : re-run the external checker and apply its fixables.
+#         + when the file finally parses/compiles: normalize layout
+#           (indentation snapped to the language grid, trailing whitespace).
+# Entirely offline - the "intelligence" is the language's own toolchain
+# plus a large hand-written repair catalog. No APIs, no internet.
+# ==========================================================================
+
+WORD_RE_FIX = r"[A-Za-z_][A-Za-z0-9_]*"
+
+UNICODE_PUNCT = {
+    "“": '"', "”": '"', "„": '"', "″": '"',
+    "‘": "'", "’": "'", "‚": "'", "′": "'",
+    "＂": '"', "＇": "'",
+    "（": "(", "）": ")", "［": "[", "］": "]",
+    "｛": "{", "｝": "}",
+    "，": ",", "；": ";", "：": ":", "．": ".",
+    "！": "!", "？": "?", "＝": "=", "＋": "+",
+    "－": "-", "＊": "*", "／": "/", "＜": "<",
+    "＞": ">", "、": ",", "。": ".",
+    "–": "-", "—": "-", "−": "-",
+    " ": " ", "　": " ",
+}
+
+
+def normalize_unicode_punct(text, lang_id):
+    """Replace curly quotes / full-width punctuation with ASCII, everywhere
+    except inside VALID strings and comments (a broken smart-quoted string is
+    not tokenized as a string, so its delimiters do get repaired)."""
+    if not (set(text) & set(UNICODE_PUNCT)):
+        return text
+    protected = []
+    try:
+        for s, e, tt in tokenize(text, lang_id):
+            if tt in ("string", "comment", "codeblock"):
+                protected.append((s, e))
+    except Exception:
+        pass
+    out = list(text)
+    pi = 0
+    for i, ch in enumerate(out):
+        rep = UNICODE_PUNCT.get(ch)
+        if rep is None:
+            continue
+        while pi < len(protected) and protected[pi][1] <= i:
+            pi += 1
+        if pi < len(protected) and protected[pi][0] <= i < protected[pi][1]:
+            continue
+        out[i] = rep
+    return "".join(out)
+
+
+def apply_text_edits(text, edits):
+    """Apply [(l1,c1,l2,c2,replacement)] with 1-based lines and 1-based BYTE
+    columns (clang's convention). Bottom-up; overlapping edits skipped."""
+    blob = text.encode("utf-8")
+    lines = blob.split(b"\n")
+    starts = [0]
+    for ln in lines[:-1]:
+        starts.append(starts[-1] + len(ln) + 1)
+    spans = []
+    for (l1, c1, l2, c2, rep) in edits:
+        if not (1 <= l1 <= len(lines) and 1 <= l2 <= len(lines)):
+            continue
+        a = starts[l1 - 1] + max(0, c1 - 1)
+        b = starts[l2 - 1] + max(0, c2 - 1)
+        if a > b or b > len(blob):
+            continue
+        spans.append((a, b, rep.encode("utf-8")))
+    spans.sort(key=lambda s: (-s[0], -s[1]))
+    prev_start = None
+    for a, b, rep in spans:
+        if prev_start is not None and b > prev_start:
+            continue
+        blob = blob[:a] + rep + blob[b:]
+        prev_start = a
+    return blob.decode("utf-8", "replace")
+
+
+def apply_issue_fixes_text(text, lang_id, issues=None):
+    """Apply every fixable issue from the fast checker to plain text."""
+    sp = LANGS[lang_id]
+    if issues is None:
+        try:
+            issues = check_source(text, lang_id)
+        except Exception:
+            return text, []
+    fixables = [i for i in issues if i.fix]
+    if not fixables:
+        return text, []
+    lines = text.split("\n")
+    notes = []
+    for iss in sorted(fixables, key=lambda i: (-i.line, -i.col)):
+        kind, data = iss.fix
+        if kind == "append_eof":
+            lines[-1] = lines[-1] + data
+            notes.append("end of file: closed with %s" % data)
+            continue
+        if not (1 <= iss.line <= len(lines)):
+            continue
+        old = lines[iss.line - 1]
+        if kind == "rename_class":
+            if iss.end <= len(old):
+                new = old[:iss.col] + data + old[iss.end:]
+            else:
+                new = None
+        else:
+            new = fixed_line_text(old, iss, sp)
+        if new is not None and new != old:
+            lines[iss.line - 1] = new
+            notes.append("line %d: %s" % (iss.line, iss.msg))
+    return "\n".join(lines), notes
+
+
+# ---- Python: parser-driven syntax repair ---------------------------------
+
+_HDR_LINE_RE = re.compile(r"on line (\d+)")
+
+
+def _indent_of(line):
+    m = re.match(r"[ \t]*", line)
+    return m.group(0).replace("\t", "    ")
+
+
+def py_syntax_fix_round(text):
+    """Ask the real parser what is wrong and repair that one thing.
+    Returns (new_text, [notes]); unchanged text means nothing was done."""
+    try:
+        ast.parse(text)
+        return text, []
+    except SyntaxError as exc:
+        err = exc
+    ln = err.lineno or 1
+    col = max(0, (err.offset or 1) - 1)
+    msg = (err.msg or "").lower()
+    lines = text.split("\n")
+    if ln - 1 >= len(lines):
+        ln = len(lines)
+    cur = lines[ln - 1] if lines else ""
+
+    def note(t):
+        new_text = "\n".join(lines)
+        if new_text == text:
+            return text, []
+        return new_text, ["line %d: %s" % (ln, t)]
+
+    # 1 2  ->  1, 2
+    if "forgot a comma" in msg:
+        k = col
+        while k < len(cur) and (cur[k].isalnum() or cur[k] in "_\"'.)]}"):
+            k += 1
+        lines[ln - 1] = cur[:k] + "," + cur[k:]
+        return note("inserted the missing ','")
+
+    # if x = 1  ->  if x == 1
+    if "maybe you meant '=='" in msg or "cannot assign to" in msg:
+        masked, _ = split_code_comment(cur, "#")
+        m = re.search(r"(?<![=!<>+\-*/%&|^])=(?![=])", masked)
+        if m:
+            lines[ln - 1] = cur[:m.start()] + "==" + cur[m.start() + 1:]
+            return note("changed '=' to '==' (comparison)")
+
+    # def f():\nx = 1  ->  indent the body (or add pass)
+    if "expected an indented block" in msg:
+        hm = _HDR_LINE_RE.search(err.msg or "")
+        hdr = int(hm.group(1)) if hm else max(1, ln - 1)
+        want = _indent_of(lines[hdr - 1]) + "    " if hdr - 1 < len(lines) \
+            else "    "
+        if ln - 1 < len(lines) and lines[ln - 1].strip():
+            lines[ln - 1] = want + lines[ln - 1].lstrip()
+            return note("indented this line under the block on line %d" % hdr)
+        lines.insert(hdr, want + "pass")
+        return note("added 'pass' so the empty block on line %d is valid" % hdr)
+
+    # stray extra indentation
+    if "unexpected indent" in msg:
+        prev = ""
+        for k in range(ln - 2, -1, -1):
+            if lines[k].strip():
+                prev = lines[k]
+                break
+        base = _indent_of(prev)
+        code_prev = split_code_comment(prev, "#")[0].rstrip()
+        if code_prev.endswith(":"):
+            base += "    "
+        lines[ln - 1] = base + lines[ln - 1].lstrip()
+        return note("re-aligned this line's indentation")
+
+    # dedent that matches no outer level: try candidate repairs and keep the
+    # first one the parser accepts (or that at least moves past this error)
+    if "unindent does not match" in msg:
+        w = len(_indent_of(cur))
+        stack = [0]
+        for k in range(ln - 1):
+            l = lines[k]
+            if not l.strip():
+                continue
+            lw = len(_indent_of(l))
+            if lw > stack[-1]:
+                stack.append(lw)
+            else:
+                while len(stack) > 1 and stack[-1] > lw:
+                    stack.pop()
+        cands = []
+        # A: snap this line to the nearest open block level (tie -> deeper,
+        #    so a `return` stays inside its function)
+        near = min(stack, key=lambda s: (abs(s - w), -s))
+        a = list(lines)
+        a[ln - 1] = " " * near + cur.lstrip()
+        cands.append((a, "snapped this line to the enclosing block level"))
+        # B: the PREVIOUS line was the over-indented one - align it with its
+        #    own block header + one indent
+        pk = ln - 2
+        while pk >= 0 and not lines[pk].strip():
+            pk -= 1
+        if pk >= 0:
+            pw = len(_indent_of(lines[pk]))
+            hk = pk - 1
+            while hk >= 0:
+                l = lines[hk]
+                if l.strip() and len(_indent_of(l)) < pw:
+                    break
+                hk -= 1
+            if hk >= 0:
+                want = _indent_of(lines[hk]) + "    "
+                b = list(lines)
+                b[pk] = want + lines[pk].lstrip()
+                cands.append((b, "re-aligned the over-indented line %d"
+                              % (pk + 1)))
+        for cand, why in cands:
+            new_text = "\n".join(cand)
+            if new_text == text:
+                continue
+            try:
+                ast.parse(new_text)
+                return new_text, ["line %d: %s" % (ln, why)]
+            except SyntaxError as e2:
+                if (e2.lineno, (e2.msg or "").lower()[:20]) != \
+                        (ln, msg[:20]):
+                    return new_text, ["line %d: %s" % (ln, why)]
+        return text, []
+
+    # "x = "abc   ->   x = "abc"
+    if ("unterminated string literal" in msg
+            or "eol while scanning string literal" in msg):
+        q = cur[col] if col < len(cur) and cur[col] in "\"'" else "\""
+        lines[ln - 1] = cur + q
+        return note("closed the string with %s" % q)
+
+    if "unterminated triple-quoted" in msg:
+        q = '"""' if '"""' in text else "'''"
+        lines[-1] = lines[-1] + ("\n" if lines[-1].strip() else "") + q
+        return note("closed the triple-quoted string")
+
+    # anything the fast checker already knows how to fix (missing ':',
+    # unclosed brackets, python-2 print, tabs...) is handled by the caller.
+    return text, []
+
+
+def _py_scan_names(tree):
+    """(defined, used{name:(line,col)}, imports[{...}], star) for a module."""
+    defined = set()
+    used = {}
+    imports = []
+    star = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                nm = a.asname or a.name.split(".")[0]
+                defined.add(nm)
+                imports.append({"alias": nm, "module": a.name,
+                                "line": node.lineno, "from": None})
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            for a in node.names:
+                if a.name == "*":
+                    star = True
+                    continue
+                nm = a.asname or a.name
+                defined.add(nm)
+                imports.append({"alias": nm, "module": a.name,
+                                "line": node.lineno, "from": node.module})
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            defined.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            defined.update(node.names)
+        elif isinstance(node, ast.arg):
+            defined.add(node.arg)
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            else:
+                used.setdefault(node.id, (node.lineno, node.col_offset))
+        elif _MatchAs and isinstance(node, _MatchAs) and node.name:
+            defined.add(node.name)
+        elif _MatchStar and isinstance(node, _MatchStar) and node.name:
+            defined.add(node.name)
+        elif _MatchMapping and isinstance(node, _MatchMapping) and node.rest:
+            defined.add(node.rest)
+    return defined, used, imports, star
+
+
+def rename_word(text, lang_id, old, new):
+    """Replace whole-word occurrences of `old` outside strings/comments."""
+    protected = []
+    try:
+        for s, e, tt in tokenize(text, lang_id):
+            if tt in ("string", "comment", "codeblock"):
+                protected.append((s, e))
+    except Exception:
+        pass
+
+    def shielded(pos):
+        for s, e in protected:
+            if s <= pos < e:
+                return True
+        return False
+    out = []
+    last = 0
+    for m in re.finditer(r"\b%s\b" % re.escape(old), text):
+        if shielded(m.start()):
+            continue
+        out.append(text[last:m.start()])
+        out.append(new)
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _import_insert_line(lines):
+    """Best line index for a new import: after shebang/docstring/imports."""
+    i = 0
+    n = len(lines)
+    if i < n and lines[i].startswith("#!"):
+        i += 1
+    while i < n and (not lines[i].strip() or lines[i].lstrip().startswith("#")):
+        i += 1
+    if i < n and re.match(r'\s*[rRbBuUfF]*("""|\'\'\')', lines[i]):
+        q = re.search(r'("""|\'\'\')', lines[i]).group(1)
+        rest = lines[i].split(q, 1)[1]
+        if q not in rest:
+            i += 1
+            while i < n and q not in lines[i]:
+                i += 1
+        i += 1
+    while i < n and (not lines[i].strip()
+                     or re.match(r"\s*(import|from)\s", lines[i])):
+        i += 1
+    return i
+
+
+def py_semantic_fix_round(text):
+    """Typo renames, stdlib auto-imports, unused-import removal.
+    Only runs when the module parses. Returns (new_text, notes)."""
+    import difflib
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text, []
+    notes = []
+    defined, used, imports, star = _py_scan_names(tree)
+    if star:
+        return text, []
+    kw_set = set(__import__("keyword").kwlist)
+
+    # a) undefined names: auto-import stdlib modules, else fuzzy-rename typos
+    for name in sorted(used):
+        if name in defined or name in _PY_BUILTINS:
+            continue
+        if name in _SAFE_STDLIB:
+            lines = text.split("\n")
+            at = _import_insert_line(lines)
+            lines.insert(at, "import %s" % name)
+            notes.append("added the missing 'import %s'" % name)
+            return "\n".join(lines), notes
+        pool = sorted((defined | _PY_BUILTINS | _SAFE_STDLIB) - kw_set)
+        cand = difflib.get_close_matches(name, pool, n=1, cutoff=0.8)
+        if not cand and len(name) >= 4:
+            cand = difflib.get_close_matches(name, pool, n=1, cutoff=0.72)
+        if cand and cand[0] != name:
+            fixed = rename_word(text, "python", name, cand[0])
+            if fixed != text:
+                notes.append("renamed '%s' to '%s' (typo)" % (name, cand[0]))
+                return fixed, notes
+
+    # b) unused imports: drop them
+    used_names = set(used)
+    lines = text.split("\n")
+    for imp in imports:
+        nm = imp["alias"]
+        if nm.startswith("_") or nm in used_names or "__all__" in defined:
+            continue
+        li = imp["line"] - 1
+        if not (0 <= li < len(lines)):
+            continue
+        raw = lines[li]
+        names_on_line = [i for i in imports if i["line"] == imp["line"]]
+        if len(names_on_line) == 1:
+            del lines[li]
+        else:
+            new = re.sub(r"(,\s*%s\b(\s+as\s+\w+)?)|(\b%s\b(\s+as\s+\w+)?\s*,\s*)"
+                         % (re.escape(imp["module"].split(".")[0] if not imp["from"] else nm),
+                            re.escape(imp["module"] if not imp["from"] else nm)),
+                         "", raw, count=1)
+            if new == raw:
+                continue
+            lines[li] = new
+        notes.append("removed unused import '%s'" % nm)
+        return "\n".join(lines), notes
+    return text, notes
+
+
+# ---- C/C++: apply the compiler's own machine-readable fix-its ------------
+
+_FIXIT_RE = re.compile(
+    r'^fix-it:"([^"]*)":\{(\d+):(\d+)-(\d+):(\d+)\}:"((?:[^"\\]|\\.)*)"')
+
+
+def clang_fix_edits(lang_id, text):
+    """One compile pass with -fdiagnostics-parseable-fixits.
+    Returns (edits, notes) - the compiler's exact repairs."""
+    tool = linter_tool(lang_id)
+    if not tool or lang_id not in ("c", "cpp"):
+        return [], []
+    d = tempfile.mkdtemp(prefix="geskofix-")
+    try:
+        path = os.path.join(d, "buffer" + LANGS[lang_id]["exts"][0])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        argv = [tool, "-fsyntax-only", "-fdiagnostics-parseable-fixits",
+                "-std=c11" if lang_id == "c" else "-std=c++17", path]
+        try:
+            proc = subprocess.run(argv, cwd=d, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  timeout=12, errors="replace")
+        except (subprocess.TimeoutExpired, OSError):
+            return [], []
+        edits, notes = [], []
+        last = ""
+        base = os.path.basename(path)
+        for line in (proc.stdout or "").splitlines():
+            dm = _DIAG_FULL.match(line)
+            if dm and dm.group("s") != "note":
+                last = "line %s: %s" % (dm.group("l"), dm.group("m").strip())
+            fm = _FIXIT_RE.match(line)
+            if fm and os.path.basename(fm.group(1)) == base:
+                try:
+                    rep = fm.group(6).encode("utf-8").decode("unicode_escape")
+                except Exception:
+                    rep = fm.group(6)
+                edits.append((int(fm.group(2)), int(fm.group(3)),
+                              int(fm.group(4)), int(fm.group(5)), rep))
+                if last:
+                    notes.append(last)
+                    last = ""
+        return edits, notes
+    except Exception as ex:
+        _log_error("clang_fix_edits", ex)
+        return [], []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def external_fix_round(lang_id, text):
+    """Apply fixable diagnostics from the language's own checker."""
+    diags = run_linter(lang_id, text)
+    issues = [Issue(l, c, c + 1, sev, msg, fix)
+              for (l, c, sev, msg, fix) in diags if fix]
+    if not issues:
+        return text, []
+    return apply_issue_fixes_text(text, lang_id, issues)
+
+
+# ---- layout: indentation + whitespace normalization -----------------------
+
+def strip_trailing_ws(text, lang_id):
+    """Strip trailing spaces (not inside multiline strings); final newline."""
+    protected_lines = set()
+    try:
+        li = LineIndex(text)
+        for s, e, tt in tokenize(text, lang_id):
+            if tt in ("string", "codeblock") and "\n" in text[s:e]:
+                a = li.line_col(s)[0]
+                b = li.line_col(e - 1)[0]
+                for k in range(a, b + 1):
+                    protected_lines.add(k)
+    except Exception:
+        pass
+    lines = text.split("\n")
+    for i in range(len(lines)):
+        if (i + 1) not in protected_lines:
+            lines[i] = lines[i].rstrip()
+    out = "\n".join(lines)
+    if out.strip() and not out.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def reindent_python(text):
+    """Snap indentation to the 4-space grid. Only returns a changed text if
+    the input parsed AND the output still parses to the same tree."""
+    try:
+        before = ast.dump(ast.parse(text))
+    except SyntaxError:
+        return text
+    toks = tokenize(text, "python")
+    li = LineIndex(text)
+    _, _, _, events = scan_brackets(text, toks)
+    depths = depth_at_line_starts(li.starts, events)
+    ml_lines = set()
+    for s, e, tt in toks:
+        if tt in ("string", "comment") and "\n" in text[s:e]:
+            a = li.line_col(s)[0]
+            b = li.line_col(e - 1)[0]
+            for k in range(a + 1, b + 1):
+                ml_lines.add(k)
+    lines = text.split("\n")
+    out = []
+    stack = [0]
+    levels = {0: 0}
+    prev_colon = False
+    for idx, raw in enumerate(lines):
+        n = idx + 1
+        if n in ml_lines or depths[idx] > 0 or not raw.strip():
+            out.append(raw)
+            continue
+        w = len(_indent_of(raw))
+        if prev_colon:
+            new_level = levels[stack[-1]] + 1
+            if w > stack[-1]:
+                stack.append(w)
+                levels[w] = new_level
+            else:
+                stack.append(w + 4)
+                levels[w + 4] = new_level
+                w = w + 4
+        else:
+            while len(stack) > 1 and w < stack[-1]:
+                stack.pop()
+            if w != stack[-1]:
+                w = stack[-1]
+        target = levels.get(stack[-1], 0) * 4
+        out.append(" " * target + raw.lstrip())
+        code = split_code_comment(raw, "#")[0].rstrip()
+        prev_colon = code.endswith(":")
+    result = "\n".join(out)
+    try:
+        if ast.dump(ast.parse(result)) == before:
+            return result
+    except SyntaxError:
+        pass
+    return text
+
+
+def reindent_braces(text, lang_id):
+    """Brace/paren-driven reindent for C-family languages (whitespace is
+    insignificant there, so this is always safe)."""
+    sp = LANGS[lang_id]
+    unit = indent_unit(sp)
+    toks = tokenize(text, lang_id)
+    li = LineIndex(text)
+    _, _, _, events = scan_brackets(text, toks)
+    depths = depth_at_line_starts(li.starts, events)
+    ml_lines = set()
+    for s, e, tt in toks:
+        if tt in ("string", "comment", "codeblock") and "\n" in text[s:e]:
+            a = li.line_col(s)[0]
+            b = li.line_col(e - 1)[0]
+            for k in range(a + 1, b + 1):
+                ml_lines.add(k)
+    lines = text.split("\n")
+    out = []
+    for idx, raw in enumerate(lines):
+        n = idx + 1
+        st = raw.strip()
+        if n in ml_lines or not st or st.startswith("#"):
+            out.append(raw)
+            continue
+        d = depths[idx]
+        k = 0
+        while k < len(st) and st[k] in ")]}":
+            d -= 1
+            k += 1
+        if re.match(r"^(case\b.*|default\s*):", st):
+            d = max(0, d)  # keep switch labels at body depth
+        d = max(0, d)
+        out.append(unit * d + st)
+    return "\n".join(out)
+
+
+FORMATTERS = {
+    "go": ("gofmt",), "rust": ("rustfmt",),
+    "c": ("clang-format",), "cpp": ("clang-format",),
+}
+BRACE_LANGS = {"c", "cpp", "java", "csharp", "javascript", "typescript",
+               "go", "rust", "swift", "kotlin", "php", "css", "json"}
+
+
+def format_source(text, lang_id):
+    """Format a buffer: real formatter if installed, else built-in reindent.
+    Returns (new_text, tool_name)."""
+    for toolname in FORMATTERS.get(lang_id, ()):
+        tool = which_tool(toolname)
+        if not tool:
+            continue
+        try:
+            argv = [tool]
+            if toolname == "clang-format":
+                argv += ["-style={BasedOnStyle: llvm, IndentWidth: 4}"]
+            proc = subprocess.run(argv, input=text, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True,
+                                  timeout=10, errors="replace")
+            if proc.returncode == 0 and proc.stdout.strip():
+                return strip_trailing_ws(proc.stdout, lang_id), toolname
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    if lang_id == "python":
+        return strip_trailing_ws(reindent_python(text), lang_id), "geckofix"
+    if lang_id in BRACE_LANGS:
+        return strip_trailing_ws(reindent_braces(text, lang_id),
+                                 lang_id), "geckofix"
+    return strip_trailing_ws(text, lang_id), "geckofix"
+
+
+# ---- the conductor --------------------------------------------------------
+
+def fix_everything(text, lang_id, max_rounds=12, want_layout=True):
+    """Iteratively repair a buffer until clean or stable.
+    Returns (new_text, log_lines, remaining_issues)."""
+    log = []
+    if len(text) > 400000:
+        return text, ["file too large for deep fixing"], []
+    for _ in range(max_rounds):
+        start = text
+
+        t2 = normalize_unicode_punct(text, lang_id)
+        if t2 != text:
+            log.append("normalized curly quotes / full-width punctuation")
+            text = t2
+
+        # Built-in fixables. When a real compiler is present, leave the
+        # guess-based repairs (like missing ';') to its precise fix-its.
+        try:
+            base = check_source(text, lang_id,
+                                heuristics=linter_tool(lang_id) is None)
+        except Exception:
+            base = []
+        text, notes = apply_issue_fixes_text(text, lang_id, base)
+        log += notes
+
+        if lang_id == "python":
+            text, notes = py_syntax_fix_round(text)
+            log += notes
+            if not notes:
+                text, notes = py_semantic_fix_round(text)
+                log += notes
+        elif lang_id in ("c", "cpp") and linter_tool(lang_id):
+            edits, notes = clang_fix_edits(lang_id, text)
+            if edits:
+                fixed = apply_text_edits(text, edits)
+                if fixed != text:
+                    text = fixed
+                    log += [n + "  -> applied the compiler's fix"
+                            for n in notes[:len(edits)]]
+        elif linter_tool(lang_id):
+            text, notes = external_fix_round(lang_id, text)
+            log += notes
+
+        if text == start:
+            break
+
+    if want_layout:
+        if lang_id == "python":
+            t2 = strip_trailing_ws(reindent_python(text), lang_id)
+        elif lang_id in BRACE_LANGS and lang_id != "json":
+            t2 = strip_trailing_ws(reindent_braces(text, lang_id), lang_id)
+        else:
+            t2 = strip_trailing_ws(text, lang_id)
+        if t2 != text:
+            log.append("normalized indentation and whitespace")
+            text = t2
+
+    # What is left? Prefer the real checker's verdict when one exists.
+    try:
+        remaining = check_source(text, lang_id,
+                                 heuristics=linter_tool(lang_id) is None)
+    except Exception:
+        remaining = []
+    if linter_tool(lang_id):
+        try:
+            remaining = [Issue(l, c, c + 1, sev, msg, fix)
+                         for (l, c, sev, msg, fix) in run_linter(lang_id, text)]
+        except Exception:
+            pass
+    return text, log, remaining
+
+
 # --------------------------------------------------------------------------
 # Completion engine (document words + language vocabulary, ranked).
 # --------------------------------------------------------------------------
@@ -2714,17 +3430,26 @@ if TK_OK:
             return changed
 
         def fix_all(self):
-            issues = self.issues
-            if not any(i.fix for i in issues):
-                try:
-                    issues = check_source(self.get_text(), self.lang,
-                                          self.path or self.title)
-                except Exception as ex:
-                    _log_error("fix_all_check_source", ex)
-                    issues = self.issues
-            n = self.fix_issues(issues)
-            self.app.flash_status("Fixed %d issue%s" % (n, "" if n == 1 else "s")
-                                  if n else "Nothing to fix here")
+            """Deep repair: hand the buffer to the GeckoFix engine."""
+            self.app.deep_fix_active()
+
+        def replace_buffer(self, new_text):
+            """Swap in repaired text, keeping the caret near where it was."""
+            t = self.text
+            cur = t.index("insert")
+            t.edit_separator()
+            t.delete("1.0", "end")
+            t.insert("1.0", new_text)
+            t.edit_separator()
+            try:
+                t.mark_set("insert", cur)
+            except tk.TclError:
+                t.mark_set("insert", "end-1c")
+            t.see("insert")
+            self._mark_dirty()
+            self.highlight_all()
+            self.run_checks(show_hint=False)
+            self.app.refresh_outline_if_visible()
 
         # ---- placeholders (skeletons & snippets) ---------------------------
 
@@ -3854,7 +4579,9 @@ if TK_OK:
             em.add_separator()
             em.add_command(label="Toggle Comment", accelerator=acc("/"),
                            command=self.toggle_comment)
-            em.add_command(label="Fix All Issues", accelerator=acc("F", True),
+            em.add_command(label="Format Document", accelerator=acc("L", True),
+                           command=self.format_active)
+            em.add_command(label="Fix Everything", accelerator=acc("F", True),
                            command=self.fix_all_active)
             m.add_cascade(label="Edit", menu=em)
 
@@ -3925,6 +4652,7 @@ if TK_OK:
             bind("period", self.stop_run)
             bind("f", self.show_findbar)
             bind("F", self.fix_all_active)
+            bind("L", self.format_active)
             bind("l", self.goto_dialog)
             bind("slash", self.toggle_comment)
             bind("j", self.output.toggle)
@@ -4385,9 +5113,86 @@ if TK_OK:
                 tab.toggle_comment()
 
         def fix_all_active(self):
+            self.deep_fix_active()
+
+        def deep_fix_active(self):
+            """Run the GeckoFix engine on the active buffer (background)."""
             tab = self.active_tab()
-            if tab:
-                tab.fix_all()
+            if not tab:
+                self.flash_status("Open a file first")
+                return
+            if getattr(self, "_fixing", False):
+                self.flash_status("Already fixing…")
+                return
+            self._fixing = True
+            self.flash_status("Deep-fixing… (compilers may run)")
+            txt = tab.get_text()
+            lang = tab.lang
+            box = _queue.Queue()
+
+            def work():
+                try:
+                    box.put(fix_everything(txt, lang))
+                except Exception as ex:
+                    _log_error("fix_everything", ex)
+                    box.put((txt, ["fix engine error: %r" % ex], []))
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                try:
+                    new_text, log, remaining = box.get_nowait()
+                except _queue.Empty:
+                    self.after(80, poll)
+                    return
+                self._fixing = False
+                if not tab.winfo_exists():
+                    return
+                changed = new_text != txt
+                if changed:
+                    if tab.get_text() != txt:
+                        self.flash_status("Buffer changed while fixing - "
+                                          "run Fix Everything again")
+                        return
+                    tab.replace_buffer(new_text)
+                    tab.issues = remaining
+                    tab._render_issues(remaining)
+                    self.update_issue_ui()
+                errs = sum(1 for i in remaining if i.severity == "error")
+                self.output.begin_static("Fix report · %s" % tab.title)
+                if log:
+                    for line in log:
+                        self.output.append("out", "  ✓ %s\n" % line)
+                else:
+                    self.output.append("info", "  Nothing needed fixing.\n")
+                if errs:
+                    self.output.append("err",
+                                       "  %d error%s left (see the hint bar) - "
+                                       "some problems need a human decision.\n"
+                                       % (errs, "" if errs == 1 else "s"))
+                else:
+                    self.output.append("ok", "  No errors remain.\n")
+                self.flash_status(
+                    "Fixed %d thing%s · %d error%s left"
+                    % (len(log), "" if len(log) == 1 else "s",
+                       errs, "" if errs == 1 else "s"))
+            poll()
+
+        def format_active(self):
+            """Format Document: real formatter if installed, else built-in."""
+            tab = self.active_tab()
+            if not tab:
+                return
+            txt = tab.get_text()
+            try:
+                new_text, tool = format_source(txt, tab.lang)
+            except Exception as ex:
+                _log_error("format_source", ex)
+                return
+            if new_text != txt:
+                tab.replace_buffer(new_text)
+                self.flash_status("Formatted with %s" % tool)
+            else:
+                self.flash_status("Already tidy")
 
         def zoom(self, d):
             s = self.mono_font.cget("size")
@@ -5075,6 +5880,84 @@ def selftest():
         code, comment = split_code_comment('x = "#no"  # yes', "#")
         assert code == 'x = "#no"  ' and comment == "# yes", (code, comment)
 
+    # ---- GeckoFix deep repair engine ------------------------------------
+
+    def t_apply_edits():
+        out = apply_text_edits("int x = 1\nint y = 2\n",
+                               [(1, 10, 1, 10, ";"), (2, 10, 2, 10, ";")])
+        assert out == "int x = 1;\nint y = 2;\n", repr(out)
+        out2 = apply_text_edits("vectr\n", [(1, 1, 1, 6, "vector")])
+        assert out2 == "vector\n", repr(out2)
+
+    def t_unicode_fix():
+        src = 'x = “hi”\ns = "keep “this” inside"\n'
+        out = normalize_unicode_punct(src, "python")
+        assert 'x = "hi"' in out, repr(out)
+        assert "keep “this” inside" in out, repr(out)  # valid string untouched
+
+    def t_fixit_parse():
+        m = _FIXIT_RE.match('fix-it:"a.c":{3:18-3:18}:";"')
+        assert m and m.group(2) == "3" and m.group(6) == ";", m
+
+    def t_py_syntax_repairs():
+        cases = [
+            ("[1 2]\n", "forgot a comma", lambda o: "[1, 2]" in o),
+            ("if x = 1:\n    pass\n", "== fix", lambda o: "x == 1" in o),
+            ("def f():\nreturn 1\n", "indent block",
+             lambda o: "\n    return 1" in o),
+            ("x = 1\n    y = 2\n", "unexpected indent",
+             lambda o: "\ny = 2" in o),
+            ('s = "abc\n', "close string", lambda o: '"abc"' in o),
+        ]
+        for src, label, good in cases:
+            out, notes = py_syntax_fix_round(src)
+            assert notes and good(out), (label, out, notes)
+
+    def t_py_semantic_repairs():
+        out, n = py_semantic_fix_round("import math\nprint(maths.pi)\n")
+        assert "math.pi" in out and "maths" not in out, out
+        out2, n2 = py_semantic_fix_round("x = math.sqrt(2)\nprint(x)\n")
+        assert out2.startswith("import math\n"), out2
+        out3, n3 = py_semantic_fix_round("import os\nprint(1)\n")
+        assert "import os" not in out3, out3
+
+    def t_fix_everything_python():
+        nasty = ('import maths\n\ndef average(nums)\n    total = 0\n'
+                 '    for n in nums\n        total += n\n'
+                 '    print "avg:", total\n    return total / len(nums\n\n'
+                 'def top(items):\n        best = max(items)\n'
+                 '    return best\n\nx = average([1 2, 3])\ny = “done”\n')
+        out, log, remaining = fix_everything(nasty, "python")
+        ast.parse(out)  # must compile clean
+        assert 'print("avg:", total)' in out, out
+        assert "[1, 2, 3]" in out and '"done"' in out, out
+        assert "import maths" not in out, out
+        assert not [i for i in remaining if i.severity == "error"], remaining
+        assert len(log) >= 7, log
+
+    def t_fix_everything_c():
+        if not linter_tool("cpp"):
+            return  # no compiler on this machine - engine falls back
+        src = ('#include <vector>\nint main() {\n'
+               '    std::vectr<int> v = {1}\n    return 0;\n}\n')
+        out, log, remaining = fix_everything(src, "cpp")
+        assert "std::vector<int>" in out and "{1};" in out, out
+        assert not [i for i in remaining if i.severity == "error"], remaining
+
+    def t_reindent():
+        src = "def f():\n   x = 1\n   if x:\n         return x\n"
+        out = reindent_python(src)
+        assert out == "def f():\n    x = 1\n    if x:\n        return x\n", \
+            repr(out)
+        assert ast.dump(ast.parse(out)) == ast.dump(ast.parse(src))
+        c = "int main(){\nint x=1;\nif(x){\nx=2;\n}\nreturn x;\n}\n"
+        cout = reindent_braces(c, "c")
+        assert "\n    int x=1;" in cout and "\n        x=2;" in cout, cout
+
+    def t_format_source():
+        out, tool = format_source("def f():\n   pass   \n", "python")
+        assert out.endswith("\n") and "pass\n" in out and "   \n" not in out
+
     def t_completions():
         text = "apple banana apricot appliance apple\n"
         out = collect_completions(text, "ap", "python")
@@ -5193,6 +6076,15 @@ def selftest():
     run("external linter registry", t_linter_registry)
     run("comment splitting respects strings", t_split_comment)
     run("completion ranking", t_completions)
+    run("edit application (fix-its)", t_apply_edits)
+    run("unicode punctuation repair", t_unicode_fix)
+    run("clang fix-it line parser", t_fixit_parse)
+    run("python syntax repairs (comma/==/indent/string)", t_py_syntax_repairs)
+    run("python semantic repairs (typos/imports)", t_py_semantic_repairs)
+    run("FIX EVERYTHING: 8-error python file -> clean", t_fix_everything_python)
+    run("FIX EVERYTHING: C++ typos + ';' -> clean", t_fix_everything_c)
+    run("layout: python + brace reindent", t_reindent)
+    run("format document", t_format_source)
     run("completion: words + python member introspection", t_compute_completions)
     run("run/debug steps for every language", t_debuggers)
     run("placeholder parsing", t_placeholders)
