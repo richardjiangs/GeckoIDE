@@ -40,7 +40,7 @@ from bisect import bisect_right
 from collections import Counter, namedtuple
 
 APP = "GeskoIDE"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 IS_MAC = (sys.platform == "darwin")
 IS_WIN = (sys.platform == "win32")
 
@@ -947,7 +947,179 @@ CLIKE_SEMI_LANGS = {"c", "cpp", "java", "csharp"}
 SEMI_SKIP_START = {"if", "else", "for", "while", "switch", "do", "case",
                    "default", "try", "catch", "finally", "template",
                    "namespace", "using", "public", "private", "protected"}
-NO_BRACKET_CHECK = {"markdown", "text"}
+NO_BRACKET_CHECK = {"markdown", "text", "html"}
+
+# --------------------------------------------------------------------------
+# HTML structure analysis: tag balance, dangling '<', mismatched closes.
+# --------------------------------------------------------------------------
+
+HTML_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+             "link", "meta", "param", "source", "track", "wbr"}
+# Tags that HTML5 closes implicitly (a bare <li> or <p> is valid markup).
+HTML_IMPLIED = {"li", "p", "td", "th", "tr", "option", "dd", "dt", "thead",
+                "tbody", "tfoot", "colgroup", "caption", "optgroup", "html",
+                "head", "body"}
+HTML_RAW = {"script", "style", "pre", "textarea"}
+
+_HTML_TAG_RE = re.compile(
+    r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)((?:[^<>\"']|\"[^\"]*\"|'[^']*')*)(/?)>")
+_HTML_SKIP_RE = re.compile(
+    r"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)|<![^>]*>|<\?[^>]*\?>",
+    re.S)
+
+
+def html_scan(text):
+    """Walk the markup. Returns (problems, open_stack, raw_spans) where
+    problems are dicts: kind in unclosed|mismatch|stray, plus positions."""
+    skip = []
+    for m in _HTML_SKIP_RE.finditer(text):
+        skip.append((m.start(), m.end()))
+
+    def skipped(pos):
+        return any(a <= pos < b for a, b in skip)
+
+    problems = []
+    stack = []          # [(name, pos)]
+    covered = []        # spans of recognized tags
+    raw_until = None
+    raw_name = None
+    for m in _HTML_TAG_RE.finditer(text):
+        if skipped(m.start()):
+            continue
+        closing, name, attrs, selfclose = m.groups()
+        lname = name.lower()
+        if raw_until is not None:
+            if closing and lname == raw_name:
+                raw_until = None
+                raw_name = None
+                covered.append((m.start(), m.end()))
+                if stack and stack[-1][0] == lname:
+                    stack.pop()
+            continue
+        covered.append((m.start(), m.end()))
+        if not closing:
+            if lname in HTML_VOID or selfclose:
+                continue
+            stack.append((lname, m.start()))
+            if lname in HTML_RAW:
+                raw_until = True
+                raw_name = lname
+            continue
+        # closing tag
+        names = [n for n, _ in stack]
+        if lname not in names:
+            problems.append({"kind": "mismatch", "pos": m.start(),
+                             "end": m.end(), "close": lname,
+                             "open": stack[-1][0] if stack else None})
+            continue
+        while stack and stack[-1][0] != lname:
+            popped, ppos = stack.pop()
+            if popped not in HTML_IMPLIED:
+                # this close tag force-closed an inner element; the repair
+                # belongs right HERE, before the forcing close tag
+                problems.append({"kind": "unclosed", "pos": ppos,
+                                 "name": popped, "force_pos": m.start(),
+                                 "force_close": lname})
+        if stack:
+            stack.pop()
+    # dangling '<' that never formed a tag
+    for i, ch in enumerate(text):
+        if ch != "<" or skipped(i):
+            continue
+        if any(a <= i < b for a, b in covered):
+            continue
+        problems.append({"kind": "stray", "pos": i})
+    for name, pos in stack:
+        if name not in HTML_IMPLIED:
+            problems.append({"kind": "unclosed", "pos": pos, "name": name})
+    return problems, stack, skip
+
+
+def html_check(text, li=None):
+    """Issues for the live checker (with fixes GeckoFix knows how to apply)."""
+    issues = []
+    try:
+        problems, stack, _ = html_scan(text)
+    except Exception:
+        return issues
+    li = li or LineIndex(text)
+    lines = text.split("\n")
+    # Force-closed elements: repairs at the same spot must be emitted in
+    # REVERSE pop order so bottom-up application nests them correctly.
+    forced = [p for p in problems if p["kind"] == "unclosed"
+              and p.get("force_pos") is not None]
+    by_force = {}
+    for p in forced:
+        by_force.setdefault(p["force_pos"], []).append(p)
+    ordered = []
+    for p in problems:
+        if p["kind"] == "unclosed" and p.get("force_pos") is not None:
+            group = by_force.pop(p["force_pos"], None)
+            if group:
+                ordered.extend(reversed(group))
+        else:
+            ordered.append(p)
+    completed_by_stray = set()
+    for p in ordered[:30]:
+        ln, col = li.line_col(p["pos"])
+        line_text = lines[ln - 1] if ln - 1 < len(lines) else ""
+        if p["kind"] == "stray":
+            rest = line_text[col:]
+            # What is open right HERE? Scan the prefix.
+            inner = None
+            try:
+                _, pstack, _ = html_scan(text[:p["pos"]])
+                if pstack:
+                    inner = pstack[-1][0]
+            except Exception:
+                pass
+            frag = rest.rstrip()
+            want = "</%s>" % inner if inner else ""
+            partial = re.match(r"^</?[a-zA-Z0-9-]*$", frag or "<")
+            if want and partial and (frag in ("<", "</")
+                                     or want.startswith(frag)):
+                completed_by_stray.add(inner)
+                issues.append(Issue(
+                    ln, col, col + len(frag), "error",
+                    "Incomplete tag - finish it as '%s'" % want,
+                    ("span", (col, col + len(frag), want))))
+            else:
+                issues.append(Issue(ln, col, col + 1, "error",
+                                    "Stray '<' - write &lt; for a literal "
+                                    "less-than", ("span", (col, col + 1,
+                                                           "&lt;"))))
+        elif p["kind"] == "unclosed":
+            want = "</%s>" % p["name"]
+            if p["name"] in completed_by_stray:
+                # the completed dangling tag will close this element
+                completed_by_stray.discard(p["name"])
+                continue
+            if p.get("force_pos") is not None:
+                fl, fc = li.line_col(p["force_pos"])
+                issues.append(Issue(
+                    fl, fc, fc + 1, "warn",
+                    "<%s> (line %d) is still open here - add %s"
+                    % (p["name"], ln, want),
+                    ("span", (fc, fc, want))))
+            else:
+                issues.append(Issue(ln, col, col + len(p["name"]) + 1, "warn",
+                                    "<%s> is never closed - add %s"
+                                    % (p["name"], want),
+                                    ("append_eof", want)))
+        elif p["kind"] == "mismatch":
+            end_col = li.line_col(p["end"])[1]
+            if p["open"]:
+                want = "</%s>" % p["open"]
+                issues.append(Issue(ln, col, end_col, "error",
+                                    "</%s> closes nothing that is open - "
+                                    "did you mean %s?" % (p["close"], want),
+                                    ("span", (col, end_col, want))))
+            else:
+                issues.append(Issue(ln, col, end_col, "error",
+                                    "</%s> closes nothing that is open - "
+                                    "removing it" % p["close"],
+                                    ("span", (col, end_col, ""))))
+    return issues
 
 
 def split_code_comment(line, lc):
@@ -1054,11 +1226,19 @@ def check_source(text, lang_id, filename=None, max_issues=40, heuristics=True):
 
     # ---- unbalanced brackets (whole document) --------------------------
     if lang_id not in NO_BRACKET_CHECK:
+        brace_block = (sp["family"] == "clike"
+                       or lang_id in ("go", "rust", "swift", "kotlin",
+                                      "css", "json"))
         for off, ch in unclosed:
             ln, col = li.line_col(off)
+            # An unclosed '{' opens a BLOCK: the right repair is a closing
+            # brace at the end of the file, not on the opening line.
+            if ch == "{" and brace_block:
+                fix = ("append_eof", "\n}")
+            else:
+                fix = ("close_line", BRK_PAIR[ch])
             add(ln, col, col + 1, "warn",
-                "'%s' is never closed - add '%s'" % (ch, BRK_PAIR[ch]),
-                ("close_line", BRK_PAIR[ch]))
+                "'%s' is never closed - add '%s'" % (ch, BRK_PAIR[ch]), fix)
         for off, ch in stray:
             ln, col = li.line_col(off)
             add(ln, col, col + 1, "error",
@@ -1185,6 +1365,13 @@ def check_source(text, lang_id, filename=None, max_issues=40, heuristics=True):
                     "JSON: %s" % ex.msg)
         except Exception:
             pass
+
+    if lang_id == "html" and len(text) < 300000:
+        for iss in html_check(text, li):
+            if len(issues) < max_issues:
+                issues.append(iss)
+                if iss.severity == "error":
+                    error_lines.add(iss.line)
 
     if lang_id == "java" and filename:
         stem = os.path.splitext(os.path.basename(filename))[0]
@@ -1480,6 +1667,12 @@ def fixed_line_text(line, issue, sp):
         c = issue.col
         if c < len(line) and line[c] == "=":
             return line[:c] + "==" + line[c + 1:]
+        return None
+    if kind == "span":
+        c1, c2, rep = data
+        if 0 <= c1 <= c2 <= len(line):
+            new = line[:c1] + rep + line[c2:]
+            return new if new != line else None
         return None
     return None
 
@@ -2066,8 +2259,11 @@ def strip_trailing_ws(text, lang_id):
         if (i + 1) not in protected_lines:
             lines[i] = lines[i].rstrip()
     out = "\n".join(lines)
-    if out.strip() and not out.endswith("\n"):
-        out += "\n"
+    if out.strip():
+        if len(lines) not in protected_lines:
+            out = out.rstrip("\n")
+        if not out.endswith("\n"):
+            out += "\n"
     return out
 
 
@@ -2163,6 +2359,140 @@ def reindent_braces(text, lang_id):
     return "\n".join(out)
 
 
+def reindent_html(text):
+    """Indent markup by tag depth (2 spaces); raw blocks left untouched."""
+    try:
+        _, _, _ = html_scan(text)
+    except Exception:
+        return text
+    lines = text.split("\n")
+    li = LineIndex(text)
+    # depth at each line start, walking tags in order
+    depth = 0
+    line_depth = [0] * (len(lines) + 1)
+    raw_lines = set()
+    raw_until = None
+    events = []
+    for m in _HTML_TAG_RE.finditer(text):
+        closing, name, attrs, selfclose = m.groups()
+        lname = name.lower()
+        if raw_until:
+            if closing and lname == raw_until:
+                raw_until = None
+                events.append((m.start(), -1))
+            continue
+        if closing:
+            events.append((m.start(), -1))
+        elif lname in HTML_VOID or selfclose:
+            pass
+        else:
+            events.append((m.end(), +1))
+            if lname in HTML_RAW:
+                raw_until = lname
+    for sm in _HTML_SKIP_RE.finditer(text):
+        a = li.line_col(sm.start())[0]
+        b = li.line_col(max(sm.start(), sm.end() - 1))[0]
+        for k in range(a + 1, b + 1):
+            raw_lines.add(k)
+    ei = 0
+    events.sort()
+    for ln in range(1, len(lines) + 1):
+        start = li.starts[ln - 1]
+        while ei < len(events) and events[ei][0] < start:
+            depth = max(0, depth + events[ei][1])
+            ei += 1
+        line_depth[ln] = depth
+    out = []
+    raw_mode = False
+    for i, raw in enumerate(lines):
+        n = i + 1
+        st = raw.strip()
+        low = st.lower()
+        if re.match(r"<(script|style|pre|textarea)\b", low):
+            raw_mode = True
+            out.append("  " * line_depth[n] + st if st else raw)
+            continue
+        if raw_mode:
+            out.append(raw)
+            if re.search(r"</(script|style|pre|textarea)>", low):
+                raw_mode = False
+            continue
+        if not st or n in raw_lines:
+            out.append(raw if n in raw_lines else "")
+            continue
+        d = line_depth[n]
+        if st.startswith("</"):
+            d = max(0, d - 1)
+        out.append("  " * d + st)
+    return "\n".join(out)
+
+
+GO_PACKAGE_RE = re.compile(r"^[ \t]*package[ \t]+\w+[ \t]*$")
+GO_IMPORT_ONE = re.compile(r"^[ \t]*import[ \t]+(?:\w+[ \t]+)?\"[^\"]*\"")
+GO_IMPORT_OPEN = re.compile(r"^[ \t]*import[ \t]*\(")
+
+
+def go_structure_fix(text):
+    """Go requires: package clause first, then imports, then declarations.
+    A file whose pieces got shuffled violates that - put them back."""
+    lines = text.split("\n")
+    pkg_idx = [i for i, l in enumerate(lines) if GO_PACKAGE_RE.match(l)]
+    if not pkg_idx:
+        return text, []
+    imports = []          # (start, end) inclusive line spans
+    i = 0
+    while i < len(lines):
+        if GO_IMPORT_ONE.match(lines[i]):
+            imports.append((i, i))
+        elif GO_IMPORT_OPEN.match(lines[i]):
+            j = i
+            while j < len(lines) and ")" not in lines[j]:
+                j += 1
+            imports.append((i, min(j, len(lines) - 1)))
+            i = j
+        i += 1
+    first_code = None
+    first_decl = len(lines)
+    for i, l in enumerate(lines):
+        st = l.strip()
+        if not st or st.startswith("//"):
+            continue
+        if first_code is None:
+            first_code = i
+        if (not GO_PACKAGE_RE.match(l)
+                and not any(a <= i <= b for a, b in imports)
+                and first_decl == len(lines)):
+            first_decl = i
+    ok = (first_code == pkg_idx[0] and len(pkg_idx) == 1
+          and all(b < first_decl for a, b in imports))
+    if ok:
+        return text, []
+    taken = set()
+    pkg_line = lines[pkg_idx[0]]
+    taken.add(pkg_idx[0])
+    import_lines = []
+    for a, b in imports:
+        for k in range(a, b + 1):
+            if k not in taken:
+                import_lines.append(lines[k])
+                taken.add(k)
+    rest = [l for i, l in enumerate(lines)
+            if i not in taken and not GO_PACKAGE_RE.match(l)]
+    while rest and not rest[0].strip():
+        rest.pop(0)
+    while rest and not rest[-1].strip():
+        rest.pop()
+    out = [pkg_line, ""]
+    if import_lines:
+        out += import_lines + [""]
+    out += rest
+    new = "\n".join(out)
+    if new == text:
+        return text, []
+    return new, ["moved 'package' to the top and imports after it "
+                 "(Go requires that order)"]
+
+
 FORMATTERS = {
     "go": ("gofmt",), "rust": ("rustfmt",),
     "c": ("clang-format",), "cpp": ("clang-format",),
@@ -2191,6 +2521,8 @@ def format_source(text, lang_id):
             pass
     if lang_id == "python":
         return strip_trailing_ws(reindent_python(text), lang_id), "geckofix"
+    if lang_id == "html":
+        return strip_trailing_ws(reindent_html(text), lang_id), "geckofix"
     if lang_id in BRACE_LANGS:
         return strip_trailing_ws(reindent_braces(text, lang_id),
                                  lang_id), "geckofix"
@@ -2237,6 +2569,12 @@ def fix_everything(text, lang_id, max_rounds=12, want_layout=True):
                     text = fixed
                     log += [n + "  -> applied the compiler's fix"
                             for n in notes[:len(edits)]]
+        elif lang_id == "go":
+            text, notes = go_structure_fix(text)
+            log += notes
+            if not notes and linter_tool(lang_id):
+                text, notes = external_fix_round(lang_id, text)
+                log += notes
         elif linter_tool(lang_id):
             text, notes = external_fix_round(lang_id, text)
             log += notes
@@ -2247,6 +2585,8 @@ def fix_everything(text, lang_id, max_rounds=12, want_layout=True):
     if want_layout:
         if lang_id == "python":
             t2 = strip_trailing_ws(reindent_python(text), lang_id)
+        elif lang_id == "html":
+            t2 = strip_trailing_ws(reindent_html(text), lang_id)
         elif lang_id in BRACE_LANGS and lang_id != "json":
             t2 = strip_trailing_ws(reindent_braces(text, lang_id), lang_id)
         else:
@@ -5944,6 +6284,48 @@ def selftest():
         assert "std::vector<int>" in out and "{1};" in out, out
         assert not [i for i in remaining if i.severity == "error"], remaining
 
+    def t_html_repairs():
+        # the exact report: "<button>hello<" said 'no problem'
+        issues = check_source("<button>hello<", "html")
+        assert issues, "must flag the incomplete tag"
+        out, log, rem = fix_everything("<button>hello<", "html")
+        assert out == "<button>hello</button>\n", repr(out)
+        assert not [i for i in rem if i.severity == "error"], rem
+        # force-closed element repaired in place, not at EOF
+        out2, _, rem2 = fix_everything("<div>\n  <span>hi\n</div>\n", "html")
+        p2, _, _ = html_scan(out2)
+        assert not p2 and "</span>" in out2, out2
+        # mismatched close renamed
+        out3, _, _ = fix_everything("<div><span>x</div>\n", "html")
+        p3, _, _ = html_scan(out3)
+        assert not p3, out3
+        # partial closing tag completed
+        out4, _, _ = fix_everything("<div>\n<button>hi</butt\n</div>\n", "html")
+        assert "</button>" in out4, out4
+        p4, _, _ = html_scan(out4)
+        assert not p4, out4
+        # legal HTML5 (implied closes) must NOT be flagged
+        assert not html_check("<ul>\n<li>a\n<li>b\n</ul>\n"), "li false alarm"
+        assert not html_check('<!DOCTYPE html>\n<html><head><title>t</title>'
+                              '</head>\n<body><p>x</p>\n<br>\n<img src="i">'
+                              '\n</body></html>\n'), "page false alarm"
+
+    def t_go_structure():
+        shuffled = ('func main() {\n\tfmt.Println("hi")\n}\n\n'
+                    'package main\n\nimport "fmt"\n')
+        out, notes = go_structure_fix(shuffled)
+        assert out.lstrip().startswith("package main"), out
+        assert out.index("import") < out.index("func main"), out
+        assert notes, notes
+        # a well-ordered file is left alone
+        good = 'package main\n\nimport "fmt"\n\nfunc main() {\n}\n'
+        same, n2 = go_structure_fix(good)
+        assert same == good and not n2, (same, n2)
+        # missing closing brace gets closed at EOF
+        out2, _, _ = fix_everything(
+            'package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n', "go")
+        assert out2.rstrip().endswith("}"), out2
+
     def t_reindent():
         src = "def f():\n   x = 1\n   if x:\n         return x\n"
         out = reindent_python(src)
@@ -6083,6 +6465,8 @@ def selftest():
     run("python semantic repairs (typos/imports)", t_py_semantic_repairs)
     run("FIX EVERYTHING: 8-error python file -> clean", t_fix_everything_python)
     run("FIX EVERYTHING: C++ typos + ';' -> clean", t_fix_everything_c)
+    run("FIX EVERYTHING: html tags (<button>hello< ...)", t_html_repairs)
+    run("FIX EVERYTHING: shuffled go file reassembled", t_go_structure)
     run("layout: python + brace reindent", t_reindent)
     run("format document", t_format_source)
     run("completion: words + python member introspection", t_compute_completions)
