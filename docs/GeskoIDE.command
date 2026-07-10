@@ -40,7 +40,7 @@ from bisect import bisect_right
 from collections import Counter, namedtuple
 
 APP = "GeskoIDE"
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 IS_MAC = (sys.platform == "darwin")
 IS_WIN = (sys.platform == "win32")
 
@@ -1508,15 +1508,40 @@ EXTERNAL_LINTERS = {
 }
 
 _tool_cache = {}
+_tool_health = {}
+
+
+def _tool_healthy(tool):
+    """True when the tool actually runs. On a Mac WITHOUT the Command Line
+    Tools, /usr/bin/clang & co. exist as Apple shims that only print an
+    'install developer tools' notice - treating those as real compilers made
+    diagnostics and fixes silently disappear."""
+    if tool in _tool_health:
+        return _tool_health[tool]
+    ok = True
+    try:
+        r = subprocess.run([tool, "--version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=6)
+        out = (r.stdout or b"").lower()
+        if (b"xcode-select" in out or b"developer tools" in out
+                or b"command line tools" in out):
+            ok = False
+    except Exception:
+        ok = False
+    _tool_health[tool] = ok
+    return ok
 
 
 def linter_tool(lang_id):
-    """Path of the checker for a language, or None. Cached per process."""
+    """Path of a WORKING checker for a language, or None. Cached."""
     spec = EXTERNAL_LINTERS.get(lang_id)
     if not spec:
         return None
     if lang_id not in _tool_cache:
-        _tool_cache[lang_id] = which_tool(*spec["tools"])
+        tool = which_tool(*spec["tools"])
+        if tool and not _tool_healthy(tool):
+            tool = None
+        _tool_cache[lang_id] = tool
     return _tool_cache[lang_id]
 
 
@@ -1894,6 +1919,51 @@ def py_syntax_fix_round(text):
         return text, []
     except SyntaxError as exc:
         err = exc
+    return _py_dispatch(text, err)
+
+
+def _py_missing_comma_guess(masked, depth0):
+    """Column to insert ',' between two adjacent atoms inside brackets,
+    or None. Works without any error-message hint (Python 3.9 says only
+    'invalid syntax' for `[1 2]`)."""
+    depth = depth0
+    in_str = None
+    prev_atom_end = None
+    i = 0
+    n = len(masked)
+    while i < n:
+        c = masked[i]
+        if c in "([{":
+            depth += 1
+            prev_atom_end = None
+        elif c in ")]}":
+            depth -= 1
+            prev_atom_end = i + 1
+        elif depth > 0:
+            if c.isspace():
+                i += 1
+                continue
+            m = re.match(r"[A-Za-z_0-9.]+|\"[^\"]*\"|'[^']*'", masked[i:])
+            if m:
+                word = m.group(0)
+                if (prev_atom_end is not None
+                        and word not in ("for", "in", "if", "else", "not",
+                                         "and", "or", "is", "None", "True",
+                                         "False", "lambda")
+                        and masked[prev_atom_end:i].strip() == ""
+                        and i > prev_atom_end):
+                    return prev_atom_end
+                i += len(word)
+                prev_atom_end = i
+                continue
+            prev_atom_end = None
+        i += 1
+    return None
+
+
+def _py_dispatch(text, err):
+    """Message-driven repair, with structural fallbacks so it also works on
+    old Pythons (Apple ships 3.9, which says only 'invalid syntax')."""
     ln = err.lineno or 1
     col = max(0, (err.offset or 1) - 1)
     msg = (err.msg or "").lower()
@@ -2015,6 +2085,29 @@ def py_syntax_fix_round(text):
         q = '"""' if '"""' in text else "'''"
         lines[-1] = lines[-1] + ("\n" if lines[-1].strip() else "") + q
         return note("closed the triple-quoted string")
+
+    # ---- structural fallbacks: old Pythons (Apple ships 3.9) say only
+    # "invalid syntax" for many of the above, so diagnose the line ourselves.
+    if "invalid syntax" in msg or "cannot assign" in msg:
+        toks = tokenize(text, "python")
+        li = LineIndex(text)
+        masked = _masked(text, li, ln,
+                         [t for t in toks if li.line_col(t[0])[0] == ln], cur)
+        # a) '=' where '==' was meant, in a condition
+        if re.match(r"^\s*(if|while|elif)\b", masked):
+            m2 = re.search(r"(?<![=!<>+\-*/%&|^])=(?![=])", masked)
+            if m2:
+                lines[ln - 1] = (cur[:m2.start()] + "=="
+                                 + cur[m2.start() + 1:])
+                return note("changed '=' to '==' (comparison)")
+        # b) missing ',' between adjacent items inside brackets
+        _, _, _, events = scan_brackets(text, toks)
+        depths = depth_at_line_starts(li.starts, events)
+        d0 = depths[ln - 1] if ln - 1 < len(depths) else 0
+        at = _py_missing_comma_guess(masked, d0)
+        if at is not None and at <= len(cur):
+            lines[ln - 1] = cur[:at] + "," + cur[at:]
+            return note("inserted the missing ','")
 
     # anything the fast checker already knows how to fix (missing ':',
     # unclosed brackets, python-2 print, tabs...) is handled by the caller.
@@ -3136,6 +3229,54 @@ def _tool_missing(name, hint):
             "while coding)." % (name, hint))
 
 
+# Executes a .sql file against an in-memory SQLite database using nothing
+# but the Python standard library, printing SELECT results as tables.
+SQL_RUNNER_SRC = r'''
+import sqlite3, sys
+db = sqlite3.connect(":memory:")
+cur = db.cursor()
+buf = ""
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    src = f.read()
+for line in src.splitlines(True):
+    buf += line
+    if sqlite3.complete_statement(buf):
+        stmt = buf.strip()
+        buf = ""
+        if not stmt:
+            continue
+        try:
+            cur.execute(stmt)
+        except sqlite3.Error as e:
+            print("SQL error: %s" % e)
+            print("  in: %s" % stmt.splitlines()[0][:70])
+            continue
+        if cur.description:
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchmany(200)
+            widths = [max(len(str(c)), *(len(str(r[i])) for r in rows))
+                      if rows else len(str(c)) for i, c in enumerate(cols)]
+            line1 = " | ".join(str(c).ljust(widths[i])
+                               for i, c in enumerate(cols))
+            print(line1)
+            print("-+-".join("-" * w for w in widths))
+            for r in rows:
+                print(" | ".join(str(v).ljust(widths[i])
+                                 for i, v in enumerate(r)))
+            print("(%d row%s)" % (len(rows), "" if len(rows) == 1 else "s"))
+        elif cur.rowcount != -1:
+            print("ok (%d row%s affected)"
+                  % (cur.rowcount, "" if cur.rowcount == 1 else "s"))
+if buf.strip():
+    try:
+        cur.execute(buf)
+        print("ok")
+    except sqlite3.Error as e:
+        print("SQL error: %s" % e)
+db.commit()
+'''
+
+
 def _native_debugger():
     """Path to lldb or gdb if present (both ship with common dev toolchains)."""
     return which_tool("lldb", "gdb")
@@ -3151,7 +3292,7 @@ def _dbg_step(dbg, binout):
                      "| continue | quit"}
 
 
-def build_steps(lang_id, path, debug=False):
+def build_steps(lang_id, path, debug=False, breakpoints=()):
     """Return ("steps", [ {argv, label?, stdin_file?} ]) or ("info", msg)
     or ("open", path). Everything runs 100% locally."""
     r = LANGS[lang_id]["run"] or lang_id
@@ -3162,9 +3303,18 @@ def build_steps(lang_id, path, debug=False):
     if r == "python":
         py = sys.executable or which_tool("python3", "python")
         if debug:
-            return "steps", [{"argv": [py, "-u", "-m", "pdb", path],
-                              "label": "pdb debugger - n:next  s:step  c:continue  "
-                                       "p expr:print  b line:breakpoint  q:quit"}]
+            argv = [py, "-u", "-m", "pdb"]
+            for bp in sorted(breakpoints or ()):
+                argv += ["-c", "b %d" % bp]
+            if breakpoints:
+                argv += ["-c", "c"]
+            argv.append(path)
+            lbl = ("pdb debugger%s - use the buttons above, or type: n=next  "
+                   "s=step  c=continue  p expr  q=quit"
+                   % (" · %d breakpoint%s set"
+                      % (len(breakpoints), "" if len(breakpoints) == 1
+                         else "s") if breakpoints else ""))
+            return "steps", [{"argv": argv, "label": lbl}]
         return "steps", [{"argv": [py, "-u", path]}]
 
     if r == "node":
@@ -3322,11 +3472,11 @@ def build_steps(lang_id, path, debug=False):
                         "files and you run with `dotnet run`.")
 
     if r == "sql":
-        sq = which_tool("sqlite3")
-        if not sq:
-            return _tool_missing("sqlite3", "macOS ships it by default.")
-        return "steps", [{"argv": [sq, "-batch", ":memory:"], "stdin_file": path,
-                          "label": "sqlite3 in-memory database"}]
+        # SQLite ships INSIDE Python's standard library - no external tool,
+        # no install, works offline everywhere GeskoIDE runs.
+        py = sys.executable or which_tool("python3", "python")
+        return "steps", [{"argv": [py, "-c", SQL_RUNNER_SRC, path],
+                          "label": "SQLite (bundled with GeskoIDE)"}]
 
     if r == "html":
         return "open", path
@@ -3650,21 +3800,30 @@ if TK_OK:
                 color = THEME["accent"] if ln == cur else THEME["fg_faint"]
                 self.create_text(w - 8, y + 1, anchor="ne", text=str(ln),
                                  fill=color, font=fnt)
+                if ln in ed.breakpoints:
+                    self.create_oval(2, y + 3, 13, y + 14, outline="",
+                                     fill="#e05555")
                 sev = ed.issue_lines.get(ln)
                 if sev:
-                    self.create_oval(5, y + 5, 11, y + 11, outline="",
+                    x0 = 15 if ln in ed.breakpoints else 5
+                    self.create_oval(x0, y + 5, x0 + 6, y + 11, outline="",
                                      fill=THEME[SEV_COLOR_KEY[sev]])
                 nxt = t.index("%d.0+1line" % ln)
                 if nxt == i:
                     break
                 i = nxt
             digits = len(t.index("end-1c").split(".")[0])
-            want = 20 + fnt.measure("0") * max(2, digits)
+            want = 24 + fnt.measure("0") * max(2, digits)
             if abs(want - w) > 3:
                 self.configure(width=want)
 
         def _click(self, ev):
             i = self.editor.text.index("@0,%d" % ev.y)
+            ln = int(i.split(".")[0])
+            if ev.x <= 14:
+                # click the left edge: toggle a breakpoint (used by Debug)
+                self.editor.toggle_breakpoint(ln)
+                return
             self.editor.text.mark_set("insert", "%s linestart" % i)
             self.editor.text.focus_set()
             self.editor.update_current_line()
@@ -3699,6 +3858,7 @@ if TK_OK:
             self._suppress = False
             self._version = 0            # bumps on every edit (lint staleness)
             self._comp = None            # inline completion cycle state
+            self.breakpoints = set()     # 1-based line numbers (click gutter)
             self._lint_q = _queue.Queue()
             self._lint_running = False
             self._lint_pending = False
@@ -4581,6 +4741,17 @@ if TK_OK:
                     depth -= 1
             return None
 
+        def toggle_breakpoint(self, ln):
+            if ln in self.breakpoints:
+                self.breakpoints.discard(ln)
+            else:
+                self.breakpoints.add(ln)
+            self.gutter.schedule()
+            self.app.flash_status(
+                "Breakpoint %s line %d - Debug (%sR with shift) stops there"
+                % ("removed from" if ln not in self.breakpoints else "set on",
+                   ln, "⌘" if IS_MAC else "Ctrl+"))
+
         def goto_line(self, n):
             t = self.text
             n = max(1, min(n, int(t.index("end-1c").split(".")[0])))
@@ -4714,6 +4885,22 @@ if TK_OK:
             self.text.tag_configure("cmd", foreground=THEME["fg_dim"])
             self.text.tag_configure("in", foreground=THEME["accent"])
             self.text.tag_configure("ok", foreground=THEME["ok"])
+            # Debugger controls (shown during pdb / lldb / gdb sessions)
+            self.dbgrow = tk.Frame(self, bg=THEME["bg_panel"])
+            for label, cmd in (("▷ Next", "n"), ("↓ Step", "s"),
+                               ("↑ Out", "r"), ("▶ Continue", "c"),
+                               ("👁 Vars", "p {k: v for k, v in "
+                                          "locals().items() "
+                                          "if not k.startswith('_')}"),
+                               ("≡ Where", "w"), ("✕ Quit", "q")):
+                FlatButton(self.dbgrow, label,
+                           (lambda c=cmd: self.send_cmd(c)),
+                           font=app.small_font, padx=8, pady=1)\
+                    .pack(side="left", padx=3, pady=3)
+            tk.Label(self.dbgrow, text="click the gutter's left edge to set "
+                                       "breakpoints", bg=THEME["bg_panel"],
+                     fg=THEME["fg_faint"], font=app.small_font)\
+                .pack(side="left", padx=8)
             row = tk.Frame(self, bg=THEME["bg_panel"])
             row.pack(fill="x")
             tk.Label(row, text="stdin ▸", bg=THEME["bg_panel"],
@@ -4729,6 +4916,20 @@ if TK_OK:
             self.entry.bind("<Return>", self.send)
             FlatButton(row, "Send", self.send, font=app.small_font,
                        padx=8, pady=1).pack(side="left", padx=6)
+
+        def set_debug_buttons(self, on):
+            if on:
+                self.dbgrow.pack(fill="x", before=self.entry.master)
+            else:
+                self.dbgrow.pack_forget()
+
+        def send_cmd(self, cmd):
+            r = self.app.runner
+            if r and r.alive():
+                self.append("in", "▸ %s\n" % cmd)
+                r.send_line(cmd)
+            else:
+                self.append("info", "The debugger is not running.\n")
 
         def show(self):
             if not self.visible:
@@ -4759,6 +4960,7 @@ if TK_OK:
 
         def begin_static(self, title):
             self.show()
+            self.set_debug_buttons(False)
             self.append("cmd", "\n── %s ──\n" % title)
             self.state_lbl.config(text="")
 
@@ -5371,6 +5573,8 @@ if TK_OK:
                                      postcommand=self._fill_lang_menu)
             tm.add_cascade(label="Language", menu=self.lang_menu)
             tm.add_separator()
+            tm.add_command(label="Database Console…",
+                           command=self.show_database)
             tm.add_command(label="Language Toolchains…",
                            command=self.show_toolchains)
             tm.add_command(label="Run Self-Test", command=self.run_selftest)
@@ -6102,7 +6306,8 @@ if TK_OK:
                 self.output.append("info", "Preview opened in your browser "
                                            "(rendered locally, offline).\n")
                 return
-            kind, val = build_steps(tab.lang, path, debug=debug)
+            kind, val = build_steps(tab.lang, path, debug=debug,
+                                    breakpoints=sorted(tab.breakpoints))
             if kind == "info":
                 self.output.begin_static("Run " + tab.title)
                 self.output.append("info", val + "\n")
@@ -6115,6 +6320,8 @@ if TK_OK:
                 return
             self.runner = StepRunner(val, cwd=os.path.dirname(path) or None)
             self.output.begin_run(tab.title, debug)
+            self.output.set_debug_buttons(
+                debug and tab.lang in ("python", "c", "cpp", "rust", "java"))
             self.runner.start()
             self.output.poll(self.runner)
 
@@ -6177,6 +6384,121 @@ if TK_OK:
                 win.grab_set()
             except tk.TclError:
                 pass
+
+        def show_database(self):
+            """A real SQLite workbench - the database engine ships inside
+            Python's standard library, so this needs nothing installed."""
+            import sqlite3
+            win = tk.Toplevel(self)
+            win.title("Database Console (SQLite, built in)")
+            win.configure(bg=THEME["bg_panel"], padx=12, pady=10)
+            win.transient(self)
+            state = {"db": sqlite3.connect(":memory:"), "path": ":memory:"}
+
+            top = tk.Frame(win, bg=THEME["bg_panel"])
+            top.pack(fill="x")
+            path_lbl = tk.Label(top, text="db: :memory:", bg=THEME["bg_panel"],
+                                fg=THEME["fg_dim"], font=self.small_font)
+            path_lbl.pack(side="left", padx=(2, 8))
+
+            sql = tk.Text(win, height=5, bg=THEME["bg_input"], fg=THEME["fg"],
+                          insertbackground=THEME["caret"], bd=0,
+                          highlightthickness=1, font=self.mono_font,
+                          highlightbackground=THEME["border"],
+                          highlightcolor=THEME["accent_dark"])
+            sql.pack(fill="x", pady=6)
+            sql.insert("1.0", "select sqlite_version();")
+
+            outbox = tk.Text(win, height=16, width=86, bg="#0a100d",
+                             fg=THEME["fg"], bd=0, highlightthickness=0,
+                             font=self.mono_font, state="disabled")
+            outbox.pack(fill="both", expand=True)
+            outbox.tag_configure("err", foreground=THEME["error"])
+            outbox.tag_configure("dim", foreground=THEME["fg_dim"])
+
+            def put(s, tag="out"):
+                outbox.configure(state="normal")
+                outbox.insert("end", s, (tag,) if tag != "out" else ())
+                outbox.see("end")
+                outbox.configure(state="disabled")
+
+            def run_sql(ev=None):
+                cur = state["db"].cursor()
+                script = sql.get("1.0", "end-1c")
+                put("\n> %s\n" % " ".join(script.split())[:96], "dim")
+                try:
+                    cur.execute(script)
+                except sqlite3.Error:
+                    try:
+                        cur.executescript(script)
+                        state["db"].commit()
+                        put("ok\n")
+                        return
+                    except sqlite3.Error as e2:
+                        put("SQL error: %s\n" % e2, "err")
+                        return
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    rows = cur.fetchmany(500)
+                    put(" | ".join(cols) + "\n")
+                    put("-" * min(84, max(10, len(" | ".join(cols)))) + "\n",
+                        "dim")
+                    for r in rows:
+                        put(" | ".join(str(v) for v in r) + "\n")
+                    put("(%d row%s)\n" % (len(rows),
+                                          "" if len(rows) == 1 else "s"),
+                        "dim")
+                else:
+                    state["db"].commit()
+                    put("ok (%d row%s affected)\n"
+                        % (cur.rowcount, "" if cur.rowcount == 1 else "s"))
+
+            def open_db():
+                p = filedialog.askopenfilename(
+                    parent=win, filetypes=[("SQLite", "*.db *.sqlite *.sqlite3"),
+                                           ("All files", "*")])
+                if p:
+                    try:
+                        state["db"].close()
+                        state["db"] = sqlite3.connect(p)
+                        state["path"] = p
+                        path_lbl.config(text="db: " + shorten_home(p))
+                        put("opened %s\n" % shorten_home(p), "dim")
+                    except sqlite3.Error as e:
+                        put("could not open: %s\n" % e, "err")
+
+            def save_db():
+                p = filedialog.asksaveasfilename(
+                    parent=win, defaultextension=".db")
+                if p:
+                    try:
+                        dst = sqlite3.connect(p)
+                        state["db"].backup(dst)
+                        dst.close()
+                        put("saved to %s\n" % shorten_home(p), "dim")
+                    except (sqlite3.Error, AttributeError) as e:
+                        put("could not save: %s\n" % e, "err")
+
+            def tables():
+                sql.delete("1.0", "end")
+                sql.insert("1.0", "select name, type from sqlite_master "
+                                  "order by type, name;")
+                run_sql()
+
+            FlatButton(top, "Run (⌘⏎)", run_sql, "primary",
+                       font=self.small_font, padx=9, pady=2)\
+                .pack(side="right", padx=2)
+            for label, fn in (("Tables", tables), ("Save As…", save_db),
+                              ("Open…", open_db)):
+                FlatButton(top, label, fn, font=self.small_font,
+                           padx=8, pady=2).pack(side="right", padx=2)
+            sql.bind("<Command-Return>" if IS_MAC else "<Control-Return>",
+                     lambda e: (run_sql(), "break")[1])
+            win.bind("<Escape>", lambda e: win.destroy())
+            win.protocol("WM_DELETE_WINDOW",
+                         lambda: (state["db"].close(), win.destroy()))
+            self._center_child(win, 720, 560)
+            sql.focus_set()
 
         def show_toolchains(self):
             """Show which languages can Run / Debug with the tools present."""
@@ -6778,6 +7100,70 @@ def selftest():
                                    "obj.re", "javascript")
         assert got2 and "render" in got2 and "reload" in got2, got2
 
+    def t_legacy_python_39():
+        # Apple's macOS Python is 3.9: its parser says only "invalid syntax"
+        # where new Pythons give helpful messages. The dispatcher must repair
+        # from structure alone.
+        def fake(msg, lineno, offset):
+            e = SyntaxError(msg)
+            e.lineno, e.offset, e.msg = lineno, offset, msg
+            return e
+        out, n = _py_dispatch("x = [1 2]\n", fake("invalid syntax", 1, 8))
+        assert out == "x = [1, 2]\n" and n, (out, n)
+        out, n = _py_dispatch("if x = 1:\n    pass\n",
+                              fake("invalid syntax", 1, 6))
+        assert "x == 1" in out, out
+        out, n = _py_dispatch('s = "abc\n',
+                              fake("EOL while scanning string literal", 1, 9))
+        assert out == 's = "abc"\n', out
+        out, n = _py_dispatch("f(\n  1 2,\n  3)\n",
+                              fake("invalid syntax", 2, 5))
+        assert "1, 2" in out, out
+        # no false comma in valid constructs
+        for good in ("x = [a for a in b]\n", "f(x, not y)\n",
+                     "d = {1: 2, 3: 4}\n"):
+            same, notes = _py_dispatch(good, fake("invalid syntax", 1, 2))
+            assert "," not in [nn for nn in notes if "','" in nn] or \
+                same.count(",") == good.count(","), (good, same)
+
+    def t_tool_health():
+        d = tempfile.mkdtemp()
+        try:
+            shim = os.path.join(d, "cc")
+            with open(shim, "w") as f:
+                f.write("#!/bin/sh\necho 'xcode-select: note: No developer "
+                        "tools were found'\nexit 72\n")
+            os.chmod(shim, 0o755)
+            assert not _tool_healthy(shim), "Apple CLT shim must be rejected"
+            assert _tool_healthy(sys.executable), "real python is healthy"
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def t_sql_builtin():
+        kind, steps = build_steps("sql", "/tmp/x.sql")
+        assert kind == "steps" and steps[0]["argv"][0] == sys.executable
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "q.sql")
+            with open(p, "w") as f:
+                f.write("create table t(a, b);\n"
+                        "insert into t values (1, 'x');\n"
+                        "insert into t values (2, 'y');\n"
+                        "select * from t;\n")
+            r = subprocess.run([sys.executable, "-c", SQL_RUNNER_SRC, p],
+                               capture_output=True, text=True, timeout=20)
+            assert r.returncode == 0, r.stderr
+            assert "2 rows" in r.stdout and "y" in r.stdout, r.stdout
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def t_breakpoints_pdb():
+        kind, steps = build_steps("python", "/tmp/x.py", debug=True,
+                                  breakpoints=[3, 8])
+        argv = steps[0]["argv"]
+        assert "-m" in argv and "pdb" in argv, argv
+        assert "b 3" in argv and "b 8" in argv and "c" in argv, argv
+
     def t_reindent():
         src = "def f():\n   x = 1\n   if x:\n         return x\n"
         out = reindent_python(src)
@@ -6922,6 +7308,10 @@ def selftest():
     run("FIX EVERYTHING: json horror -> valid json", t_json_fixer)
     run("FIX EVERYTHING: css/yaml/md/sql/ruby/lua/shell", t_lang_fixers)
     run("completion: inferred types + self + dot-words", t_completion_smart)
+    run("repairs work on Apple's Python 3.9 messages", t_legacy_python_39)
+    run("fake Xcode-shim compilers are rejected", t_tool_health)
+    run("SQL runs via the BUILT-IN sqlite (no install)", t_sql_builtin)
+    run("gutter breakpoints reach the pdb debugger", t_breakpoints_pdb)
     run("layout: python + brace reindent", t_reindent)
     run("format document", t_format_source)
     run("completion: words + python member introspection", t_compute_completions)
