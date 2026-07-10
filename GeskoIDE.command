@@ -40,7 +40,7 @@ from bisect import bisect_right
 from collections import Counter, namedtuple
 
 APP = "GeskoIDE"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 IS_MAC = (sys.platform == "darwin")
 IS_WIN = (sys.platform == "win32")
 
@@ -1228,7 +1228,7 @@ def check_source(text, lang_id, filename=None, max_issues=40, heuristics=True):
     if lang_id not in NO_BRACKET_CHECK:
         brace_block = (sp["family"] == "clike"
                        or lang_id in ("go", "rust", "swift", "kotlin",
-                                      "css", "json"))
+                                      "css", "json", "perl"))
         for off, ch in unclosed:
             ln, col = li.line_col(off)
             # An unclosed '{' opens a BLOCK: the right repair is a closing
@@ -2493,6 +2493,328 @@ def go_structure_fix(text):
                  "(Go requires that order)"]
 
 
+# ---- JSON: full offline repair driven by the real parser -----------------
+
+def _sq_to_dq(text, pos):
+    """Convert the single-quoted string starting at text[pos] to double."""
+    j = pos + 1
+    buf = []
+    while j < len(text):
+        c = text[j]
+        if c == "\\" and j + 1 < len(text):
+            nxt = text[j + 1]
+            buf.append("'" if nxt == "'" else c + nxt)
+            j += 2
+            continue
+        if c == "'":
+            inner = "".join(buf).replace('"', '\\"')
+            return text[:pos] + '"' + inner + '"' + text[j + 1:]
+        buf.append(c)
+        j += 1
+    return None
+
+
+def json_fix_round(text):
+    """One repair per round, told to us by json.loads itself."""
+    if not text.strip():
+        return text, []
+    try:
+        json.loads(text)
+        return text, []
+    except json.JSONDecodeError as exc:
+        err = exc
+    pos = max(0, min(err.pos, len(text)))
+    ch = text[pos] if pos < len(text) else ""
+    msg = err.msg
+
+    def note(new, what):
+        if new is None or new == text:
+            return text, []
+        return new, ["line %d: %s" % (err.lineno, what)]
+
+    def drop_prev_comma(p):
+        k = p - 1
+        while k >= 0 and text[k] in " \t\r\n":
+            k -= 1
+        if k >= 0 and text[k] == ",":
+            return text[:k] + text[k + 1:]
+        return None
+
+    if "Expecting ',' delimiter" in msg:
+        return note(text[:pos] + "," + text[pos:], "inserted the missing ','")
+    if "Expecting ':' delimiter" in msg:
+        return note(text[:pos] + ":" + text[pos:], "inserted the missing ':'")
+    if "trailing comma" in msg.lower():        # Python 3.13+ wording
+        if ch == ",":
+            return note(text[:pos] + text[pos + 1:],
+                        "removed the trailing ','")
+        return note(drop_prev_comma(pos), "removed the trailing ','")
+    if "Expecting property name" in msg:
+        if ch == "'":
+            return note(_sq_to_dq(text, pos),
+                        "JSON strings use double quotes - converted")
+        if ch == "}":
+            return note(drop_prev_comma(pos), "removed the trailing ','")
+        m = re.match(r"[A-Za-z_][\w-]*", text[pos:])
+        if m:
+            return note(text[:pos] + '"%s"' % m.group(0)
+                        + text[pos + m.end():], "quoted the bare key")
+    if "Expecting value" in msg:
+        if ch == "'":
+            return note(_sq_to_dq(text, pos),
+                        "JSON strings use double quotes - converted")
+        m = re.match(r"(True|False|None|NaN|-?Infinity|undefined)\b",
+                     text[pos:])
+        if m:
+            rep = {"True": "true", "False": "false", "None": "null",
+                   "NaN": "null", "Infinity": "null", "-Infinity": "null",
+                   "undefined": "null"}[m.group(1)]
+            return note(text[:pos] + rep + text[pos + m.end():],
+                        "JSON spells this '%s'" % rep)
+        if ch in "]}":
+            return note(drop_prev_comma(pos), "removed the trailing ','")
+        if ch == "/" or text.lstrip().startswith("//"):
+            new = re.sub(r"(?m)//[^\n]*", "", text)
+            new = re.sub(r"/\*.*?\*/", "", new, flags=re.S)
+            return note(new, "removed // comments (not allowed in JSON)")
+        if pos >= len(text.rstrip()):
+            toks = tokenize(text, "json")
+            _, unclosed, _, _ = scan_brackets(text, toks)
+            if unclosed:
+                closers = "".join(BRK_PAIR[c] for _, c in reversed(unclosed))
+                return note(text.rstrip("\n") + closers + "\n",
+                            "closed with '%s'" % closers)
+    if "Unterminated string" in msg:
+        li = LineIndex(text)
+        lines = text.split("\n")
+        if err.lineno - 1 < len(lines):
+            lines[err.lineno - 1] += '"'
+            return note("\n".join(lines), "closed the string")
+    if "Invalid \\escape" in msg and pos < len(text):
+        return note(text[:pos] + "\\" + text[pos:], "escaped the backslash")
+    if "Invalid control character" in msg and pos < len(text):
+        rep = "\\n" if text[pos] == "\n" else ""
+        return note(text[:pos] + rep + text[pos + 1:],
+                    "escaped a raw control character inside the string")
+    return text, []
+
+
+# ---- CSS ------------------------------------------------------------------
+
+def css_fix_round(text):
+    toks = tokenize(text, "css")
+    for s, e, tt in toks:
+        if tt == "comment" and not text[s:e].rstrip().endswith("*/"):
+            # Close the comment at the end of ITS OWN line, so the code
+            # below it is not swallowed into the comment.
+            nl = text.find("\n", s)
+            if nl == -1:
+                nl = len(text)
+            return (text[:nl] + " */" + text[nl:],
+                    ["closed the unterminated /* comment"])
+    li = LineIndex(text)
+    _, _, _, events = scan_brackets(text, toks)
+    depths = depth_at_line_starts(li.starts, events)
+    lines = text.split("\n")
+    notes = []
+    for i, raw in enumerate(lines):
+        st = raw.rstrip()
+        body = st.strip()
+        if depths[i] < 1 or not body:
+            continue
+        if (re.match(r"^[\w-]+\s*:", body)
+                and not body.endswith((";", "{", "}", ","))):
+            nxt = ""
+            for k in range(i + 1, len(lines)):
+                if lines[k].strip():
+                    nxt = lines[k].strip()
+                    break
+            if not nxt or nxt.startswith("}") or re.match(r"^[\w-]+\s*:", nxt):
+                lines[i] = st + ";"
+                notes.append("line %d: added the missing ';'" % (i + 1))
+    return ("\n".join(lines), notes) if notes else (text, [])
+
+
+# ---- YAML -----------------------------------------------------------------
+
+def yaml_fix_round(text):
+    notes = []
+    out = []
+    for i, raw in enumerate(text.split("\n")):
+        line = raw
+        m = re.match(r"^([ ]*)(\t+)", line)
+        if m:
+            line = line.replace("\t", "  ", line.count("\t"))
+            notes.append("line %d: YAML forbids tabs - converted to spaces"
+                         % (i + 1))
+        new = re.sub(r"^(\s*(?:- )?[\w.$-]+):(?!//)(\S)", r"\1: \2", line)
+        if new != line:
+            notes.append("line %d: added the space YAML needs after ':'"
+                         % (i + 1))
+            line = new
+        out.append(line)
+    return ("\n".join(out), notes) if notes else (text, [])
+
+
+# ---- Markdown ---------------------------------------------------------------
+
+def markdown_fix_round(text):
+    notes = []
+    fences = len(re.findall(r"(?m)^```", text))
+    if fences % 2 == 1:
+        text = text.rstrip("\n") + "\n```\n"
+        notes.append("closed the unterminated ``` code fence")
+    new = re.sub(r"(?m)^(#{1,6})([^#\s])", r"\1 \2", text)
+    if new != text:
+        notes.append("added the space headings need after '#'")
+        text = new
+    return text, notes
+
+
+# ---- keyword/end balance repair (Ruby, Lua, Shell) -------------------------
+
+def _line_start_tok(text, li, s):
+    ln, col = li.line_col(s)
+    line = text[li.starts[ln - 1]:s]
+    return line.strip() == ""
+
+
+def ruby_end_fix(text):
+    """Append the `end`s Ruby says are missing."""
+    tool = which_tool("ruby")
+    if tool:
+        d = run_linter("ruby", text)
+        if not d:
+            return text, []
+        if not any("end-of-input" in m or "expected `end" in m
+                   or "expecting keyword_end" in m or "expecting end"
+                   in m.lower() for _, _, _, m, _ in d):
+            return text, []
+    toks = tokenize(text, "ruby")
+    li = LineIndex(text)
+    bal = 0
+    prev_line_opener = -1
+    for s, e, tt in toks:
+        if tt != "keyword":
+            continue
+        w = text[s:e]
+        ln = li.line_col(s)[0]
+        if w in ("def", "class", "module", "begin", "case"):
+            bal += 1
+            prev_line_opener = ln
+        elif w in ("if", "unless", "while", "until", "for"):
+            if _line_start_tok(text, li, s):
+                bal += 1
+                prev_line_opener = ln
+        elif w == "do":
+            if ln != prev_line_opener:
+                bal += 1
+        elif w == "end":
+            bal -= 1
+    if bal <= 0:
+        return text, []
+    bal = min(bal, 6)
+    return (text.rstrip("\n") + "\n" + "\n".join(["end"] * bal) + "\n",
+            ["added %d missing 'end'%s" % (bal, "" if bal == 1 else "s")])
+
+
+def lua_end_fix(text):
+    tool = which_tool("luac", "luac5.4", "luac5.3")
+    if tool:
+        d = run_linter("lua", text)
+        if not d or not any("'end' expected" in m or "near <eof>" in m
+                            for _, _, _, m, _ in d):
+            return text, []
+    toks = tokenize(text, "lua")
+    li = LineIndex(text)
+    bal = 0
+    reps = 0
+    prev_line_opener = -1
+    for s, e, tt in toks:
+        if tt != "keyword":
+            continue
+        w = text[s:e]
+        ln = li.line_col(s)[0]
+        if w in ("function", "if", "for", "while"):
+            bal += 1
+            prev_line_opener = ln
+        elif w == "do":
+            if ln != prev_line_opener:
+                bal += 1
+        elif w == "repeat":
+            reps += 1
+        elif w == "end":
+            bal -= 1
+        elif w == "until":
+            reps -= 1
+    notes = []
+    if bal > 0:
+        bal = min(bal, 6)
+        text = text.rstrip("\n") + "\n" + "\n".join(["end"] * bal) + "\n"
+        notes.append("added %d missing 'end'%s" % (bal, "" if bal == 1
+                                                   else "s"))
+    return text, notes
+
+
+def shell_end_fix(text):
+    sh = which_tool("bash", "sh")
+    if sh:
+        d = run_linter("shell", text)
+        if not d or not any("unexpected end of file" in m
+                            or "unexpected EOF" in m for _, _, _, m, _ in d):
+            return text, []
+    toks = tokenize(text, "shell")
+    stack = []
+    for s, e, tt in toks:
+        if tt != "keyword":
+            continue
+        w = text[s:e]
+        if w == "if":
+            stack.append("fi")
+        elif w == "do":
+            stack.append("done")
+        elif w == "case":
+            stack.append("esac")
+        elif w in ("fi", "done", "esac"):
+            if stack and stack[-1] == w:
+                stack.pop()
+    if not stack:
+        return text, []
+    closers = list(reversed(stack))[:6]
+    return (text.rstrip("\n") + "\n" + "\n".join(closers) + "\n",
+            ["closed the open block%s with %s"
+             % ("" if len(closers) == 1 else "s", " ".join(closers))])
+
+
+def sql_fix_round(text):
+    body = text.rstrip()
+    if not body:
+        return text, []
+    lines = body.split("\n")
+    last = ""
+    for l in reversed(lines):
+        st = l.strip()
+        if st and not st.startswith("--"):
+            last = st
+            break
+    if last and not last.endswith(";"):
+        return (text.rstrip("\n").rstrip() + ";\n",
+                ["added the ';' the last statement needs"])
+    return text, []
+
+
+LANG_FIXERS = {
+    "json": json_fix_round,
+    "css": css_fix_round,
+    "yaml": yaml_fix_round,
+    "markdown": markdown_fix_round,
+    "ruby": ruby_end_fix,
+    "lua": lua_end_fix,
+    "shell": shell_end_fix,
+    "sql": sql_fix_round,
+}
+
+
 FORMATTERS = {
     "go": ("gofmt",), "rust": ("rustfmt",),
     "c": ("clang-format",), "cpp": ("clang-format",),
@@ -2554,6 +2876,14 @@ def fix_everything(text, lang_id, max_rounds=12, want_layout=True):
             base = []
         text, notes = apply_issue_fixes_text(text, lang_id, base)
         log += notes
+
+        fixer = LANG_FIXERS.get(lang_id)
+        if fixer:
+            try:
+                text, notes = fixer(text)
+                log += notes
+            except Exception as ex:
+                _log_error("lang_fixer:" + lang_id, ex)
 
         if lang_id == "python":
             text, notes = py_syntax_fix_round(text)
@@ -2706,20 +3036,84 @@ def python_member_completions(text, obj, prefix, limit=40):
     return (pub + [n for n in hits if n.startswith("_")])[:limit] or None
 
 
+# Literal-based type inference for `variable.` completion (offline dir()).
+_PY_TYPE_OF_LITERAL = (
+    (re.compile(r"""=\s*(?:[frbuFRBU]{0,2})(?:\"|')"""), "str"),
+    (re.compile(r"=\s*\["), "list"),
+    (re.compile(r"=\s*\{\s*\}"), "dict"),
+    (re.compile(r"=\s*\{[^}\n]*:"), "dict"),
+    (re.compile(r"=\s*\{"), "set"),
+    (re.compile(r"=\s*\("), "tuple"),
+    (re.compile(r"=\s*-?\d+\.\d*"), "float"),
+    (re.compile(r"=\s*-?\d"), "int"),
+    (re.compile(r"=\s*(?:True|False)\b"), "bool"),
+)
+_PY_TYPE_OBJ = {"str": str, "list": list, "dict": dict, "set": set,
+                "tuple": tuple, "int": int, "float": float, "bool": bool}
+_TYPE_MEMBER_CACHE = {}
+
+
+def py_var_type(text, name):
+    """Best-effort type of a variable from its literal assignments."""
+    ty = None
+    for m in re.finditer(r"(?m)^[ \t]*%s[ \t]*(=[^=].*)$" % re.escape(name),
+                         text):
+        rhs = m.group(1)
+        for rx, t in _PY_TYPE_OF_LITERAL:
+            if rx.match(rhs):
+                ty = t
+                break
+    return ty
+
+
+def py_type_members(ty, prefix):
+    if ty not in _TYPE_MEMBER_CACHE:
+        _TYPE_MEMBER_CACHE[ty] = sorted(
+            n for n in dir(_PY_TYPE_OBJ[ty]) if not n.startswith("_"))
+    hits = [n for n in _TYPE_MEMBER_CACHE[ty] if n.startswith(prefix)]
+    return hits[:24] or None
+
+
 def compute_completions(text, line_before_cursor, lang_id):
-    """Return candidate FULL replacements for the token before the caret.
-    Smart for Python (member introspection); word-based elsewhere."""
+    """Candidate FULL replacements for the token before the caret.
+    After a dot: module members / inferred-type methods / self attributes /
+    identifiers-seen-after-dots. Otherwise ranked word completion."""
     prefix = current_word(line_before_cursor)
-    # Python member completion: `module.<prefix>`
-    if lang_id == "python":
-        m = re.search(r"([A-Za-z_][\w]*)\.\s*$"
-                      if not prefix else
-                      r"([A-Za-z_][\w]*)\.%s$" % re.escape(prefix),
-                      line_before_cursor)
-        if m:
-            got = python_member_completions(text, m.group(1), prefix)
-            if got:
-                return got
+    m = re.search(r"([A-Za-z_][\w]*)\.%s$" % re.escape(prefix),
+                  line_before_cursor)
+    str_dot = re.search(r"""["']\s*\.%s$""" % re.escape(prefix),
+                        line_before_cursor)
+    if m or str_dot:
+        if lang_id == "python":
+            if str_dot:
+                got = py_type_members("str", prefix)
+                if got:
+                    return got
+            else:
+                obj = m.group(1)
+                got = python_member_completions(text, obj, prefix)
+                if got:
+                    return got
+                if obj == "self":
+                    attrs = sorted(set(re.findall(r"\bself\.(\w+)", text)))
+                    hits = [a for a in attrs
+                            if a.startswith(prefix) and a != prefix]
+                    if hits:
+                        return hits[:24]
+                ty = py_var_type(text, obj)
+                if ty:
+                    got = py_type_members(ty, prefix)
+                    if got:
+                        return got
+        # Any language: identifiers this document uses after a dot.
+        dots = Counter(re.findall(r"\.([A-Za-z_]\w+)", text))
+        if prefix in dots:
+            dots[prefix] -= 1
+        hits = [(n, w) for w, n in dots.items()
+                if w.startswith(prefix) and n > 0 and w != prefix]
+        hits.sort(key=lambda t: (-t[0], len(t[1]), t[1]))
+        if hits:
+            return [w for _, w in hits][:16]
     return collect_completions(text, prefix, lang_id)
 
 
@@ -3870,6 +4264,13 @@ if TK_OK:
             unit = indent_unit(sp)
             before = t.get("insert linestart", "insert")
             if before.strip() == "":
+                # An empty line has nothing to complete - if the file has
+                # ERRORS anywhere, Tab repairs the whole file instead of
+                # indenting (plain indent when the file is healthy).
+                if (app.autocheck and not getattr(app, "_fixing", False)
+                        and any(i.severity == "error" for i in self.issues)):
+                    app.deep_fix_active()
+                    return "break"
                 t.insert("insert", unit)
                 return "break"
             word = current_word(before)
@@ -3913,7 +4314,15 @@ if TK_OK:
             except Exception as ex:
                 _log_error("complete", ex)
 
-            # 4) Nothing to complete here - just indent.
+            # 4) Nothing on this line to complete - but if the FILE still has
+            #    problems anywhere, Tab fixes them all (the deep engine).
+            if (app.autocheck and not getattr(app, "_fixing", False)
+                    and any(i.severity in ("error", "warn")
+                            for i in self.issues)):
+                app.deep_fix_active()
+                return "break"
+
+            # 5) Truly nothing to do - just indent.
             t.insert("insert", unit)
             return "break"
 
@@ -6326,6 +6735,49 @@ def selftest():
             'package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n', "go")
         assert out2.rstrip().endswith("}"), out2
 
+    def t_json_fixer():
+        horror = ("{'name': 'Gecko', age: 5, \"tags\": ['a' 'b',], "
+                  "active: True,}\n")
+        out, log, rem = fix_everything(horror, "json")
+        obj = json.loads(out)
+        assert obj["active"] is True and obj["age"] == 5, obj
+        assert obj["tags"] == ["a", "b"], obj
+        out2, _, _ = fix_everything('// cfg\n{"a": [1, 2\n', "json")
+        assert json.loads(out2) == {"a": [1, 2]}, out2
+
+    def t_lang_fixers():
+        out, _, _ = fix_everything("body {\n  color: red\n  margin: 0\n}\n",
+                                   "css")
+        assert out.count(";") >= 2, out
+        out, _, _ = fix_everything("/* hdr\nbody {\n  color: red\n", "css")
+        assert "*/" in out and out.rstrip().endswith("}"), out
+        out, _, _ = fix_everything("name:gecko\n\tage: 5\n", "yaml")
+        assert "name: gecko" in out and "\t" not in out, out
+        out, _, _ = fix_everything("#Title\n\n```py\nx=1\n", "markdown")
+        assert "# Title" in out and out.count("```") % 2 == 0, out
+        out, _, _ = fix_everything("select * from users\n", "sql")
+        assert out.rstrip().endswith(";"), out
+        # keyword/end balancers (pure path also works without the tools)
+        out, _, _ = fix_everything("def greet(name)\n  puts name\n", "ruby")
+        assert out.rstrip().endswith("end"), out
+        out, _, _ = fix_everything(
+            "function f(x)\n  if x then\n    print(x)\n  end\n", "lua")
+        assert out.rstrip().endswith("end"), out
+        out, _, _ = fix_everything('if [ -f x ]; then\n  echo hi\n', "shell")
+        assert out.rstrip().endswith("fi"), out
+
+    def t_completion_smart():
+        assert "upper" in (compute_completions('s = "hi"\ns.up', "s.up",
+                                               "python") or []), "str method"
+        got = compute_completions(
+            "class A:\n  def __init__(self):\n    self.name = 1\n"
+            "    self.nice = 2\n  def f(self):\n    x = self.n",
+            "    x = self.n", "python")
+        assert got and set(got) >= {"name", "nice"}, got
+        got2 = compute_completions("obj.render(); obj.reload();\nobj.re",
+                                   "obj.re", "javascript")
+        assert got2 and "render" in got2 and "reload" in got2, got2
+
     def t_reindent():
         src = "def f():\n   x = 1\n   if x:\n         return x\n"
         out = reindent_python(src)
@@ -6467,6 +6919,9 @@ def selftest():
     run("FIX EVERYTHING: C++ typos + ';' -> clean", t_fix_everything_c)
     run("FIX EVERYTHING: html tags (<button>hello< ...)", t_html_repairs)
     run("FIX EVERYTHING: shuffled go file reassembled", t_go_structure)
+    run("FIX EVERYTHING: json horror -> valid json", t_json_fixer)
+    run("FIX EVERYTHING: css/yaml/md/sql/ruby/lua/shell", t_lang_fixers)
+    run("completion: inferred types + self + dot-words", t_completion_smart)
     run("layout: python + brace reindent", t_reindent)
     run("format document", t_format_source)
     run("completion: words + python member introspection", t_compute_completions)
